@@ -38,6 +38,13 @@ grafit list                          # графы проектов в инста
 Первый `grafit up` собирает образ `grafit-embed` и **запекает в него модель** (~2 ГБ,
 разово, несколько минут). Дальше старт мгновенный.
 
+## Подключение к проекту (runbook'и)
+Пошаговые инструкции по настройке в другом проекте на той же машине:
+- **Claude Code** (полный цикл: graphify-сборка + grafit MCP + сохранение изменений в граф
+  через git-хук) — [`docs/setup-for-claude-code.md`](docs/setup-for-claude-code.md).
+- **opencode** (подключить MCP **только для чтения**; граф ведёт Claude Code) —
+  [`docs/setup-for-opencode-readonly.md`](docs/setup-for-opencode-readonly.md).
+
 ## Общий сервис эмбеддингов (`grafit-embed`)
 Чтобы модель не грузилась в RAM в каждый процесс (по копии на агента/MCP-клиента),
 `grafit up` поднимает контейнер **`grafit-embed`** на `127.0.0.1:6401`: модель в памяти
