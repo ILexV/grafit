@@ -111,7 +111,9 @@ CLS→mean pooling между версиями). Поэтому fastembed **за
 - `LoginCommandHandler → IJwtTokenService → JwtTokenService` (`impl_of`: на интерфейсе
   направление `references`↔`implements` меняется, directed shortestPath сам не пройдёт);
 - `AuthController → .Login() → LoginCommand → LoginCommandHandler` (`handled_by`: ребра
-  `mediator.Send(LoginCommand)` → handler в графе нет).
+  `mediator.Send(LoginCommand)` → handler в графе нет);
+- `AuthProvider() → AuthProvider.tsx → getAccessToken()` (`in_file`: import-рёбра живут на
+  узле-файле, а не на символе/компоненте — мост подхватывает файл резолвнутого символа).
 
 Если и мост не помог, отдаётся **fallback**: связанные символы по конвенциям и ближайшим
 references/imports вместо «не найдено».

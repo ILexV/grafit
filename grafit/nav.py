@@ -331,6 +331,26 @@ def _route_alts(graph, node: dict) -> list[tuple]:
     return alts
 
 
+def _file_node(graph, sf: str):
+    """Узел-файл для символа (его source_file). Import-рёбра живут на файле, не на символе."""
+    if not sf:
+        return None
+    base = sf.rsplit("/", 1)[-1]
+    rs = graph.query(
+        "MATCH (f:Entity {source_file:$sf}) WHERE f.label = $base RETURN f.id, f.label LIMIT 1",
+        params={"sf": sf, "base": base}).result_set
+    return (rs[0][0], rs[0][1]) if rs else None
+
+
+def _endpoint_alts(graph, node: dict) -> list[tuple]:
+    """routing-алиасы + узел-файл символа (для файл-уровневых рёбер вроде imports)."""
+    alts = _route_alts(graph, node)
+    fn = _file_node(graph, node.get("sf"))
+    if fn and fn[0] != node["id"] and all(fn[0] != a[0] for a in alts):
+        alts.append((fn[0], fn[1], "in_file"))
+    return alts
+
+
 def bridged_path(graph, a: dict, b: dict, max_hops: int = 6):
     """Путь a→b; если прямого нет — мостит концы через convention-алиасы (impl_of/handled_by).
 
@@ -342,7 +362,7 @@ def bridged_path(graph, a: dict, b: dict, max_hops: int = 6):
     direct = shortest_path(graph, a["id"], b["id"], max_hops)
     if direct:
         return direct
-    a_alts, b_alts = _route_alts(graph, a), _route_alts(graph, b)
+    a_alts, b_alts = _endpoint_alts(graph, a), _endpoint_alts(graph, b)
     # чистый convention-хоп: алиас одного конца — это сам другой конец (Command↔Handler рядом)
     for aid, _l, arel in a_alts:
         if arel and aid == b["id"]:
@@ -372,13 +392,15 @@ def bridged_path(graph, a: dict, b: dict, max_hops: int = 6):
 
 
 def render_path(name: str, path) -> str:
-    """Однострочный путь с типом каждого перехода: ─rel→ структурный, ⋯rel→ by-naming мост."""
+    """Однострочный путь с типом каждого перехода: ─rel→ структурное ребро,
+    ⋯rel→ производный переход (by-naming мост или in_file — символ→его файл)."""
     labels, rels = path
     s = labels[0]
     for i, r in enumerate(rels):
         mark = "⋯" if r.get("bridge") else "─"
         s += f"  {mark}{r['rel']}→  {labels[i + 1]}"
-    suffix = "   (⋯ = by naming)" if any(r.get("bridge") for r in rels) else ""
+    derived = list(dict.fromkeys(r["rel"] for r in rels if r.get("bridge")))
+    suffix = f"   (⋯ производные: {', '.join(derived)})" if derived else ""
     return f"[{name}] {s}{suffix}"
 
 
