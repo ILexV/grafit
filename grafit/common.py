@@ -13,6 +13,7 @@ from pathlib import Path
 HOME = Path(os.environ.get("GRAFIT_HOME", Path.home() / ".grafit"))
 CONFIG_PATH = HOME / "config.json"        # модель эмбеддингов (общая для всех проектов)
 REGISTRY_PATH = HOME / "projects.json"     # graph_name -> project abspath
+META_PATH = HOME / "meta.json"             # graph_name -> метаданные сборки (commit/время/счётчики)
 CACHE_DIR = HOME / "cache"                 # контент-адресуемый кэш эмбеддингов (по модели)
 
 # Приоритет локальных мультиязычных моделей.
@@ -87,6 +88,140 @@ def update_config(**kw) -> dict:
     cfg.update({k: v for k, v in kw.items() if v is not None})
     save_config(cfg)
     return cfg
+
+
+def now_iso() -> str:
+    """Локальное время в ISO-8601 (для built_at в meta.json)."""
+    from datetime import datetime
+    return datetime.now().isoformat(timespec="seconds")
+
+
+# --- метаданные сборки графа (свежесть) ---
+# meta.json: graph_name -> {commit, short, committed_at, branch, dirty_at_build,
+# built_at, root, nodes, edges, model}. Отдельно от реестра (тот строковый — его
+# читают list-инструменты), чтобы ничего не ломать.
+
+def load_meta() -> dict:
+    return json.loads(META_PATH.read_text()) if META_PATH.exists() else {}
+
+
+def save_meta(name: str, **kw) -> dict:
+    """Слить метаданные сборки для графа name (None-значения пропускаются)."""
+    meta = load_meta()
+    entry = meta.get(name, {})
+    entry.update({k: v for k, v in kw.items() if v is not None})
+    meta[name] = entry
+    HOME.mkdir(parents=True, exist_ok=True)
+    META_PATH.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+    return entry
+
+
+def git_info(root) -> dict | None:
+    """Состояние git рабочего дерева: commit/short/время/ветка/грязно. None — не git-репо."""
+    def g(*a):
+        try:
+            return subprocess.run(["git", "-C", str(root), *a],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+        except Exception:
+            return None
+    commit = g("rev-parse", "HEAD")
+    if not commit:
+        return None
+    return {
+        "commit": commit,
+        "short": g("rev-parse", "--short", "HEAD") or commit[:7],
+        "committed_at": g("log", "-1", "--format=%cI"),
+        "branch": g("rev-parse", "--abbrev-ref", "HEAD"),
+        "dirty": bool(g("status", "--porcelain")),
+    }
+
+
+def graph_freshness(name: str, live_root=None) -> dict:
+    """Насколько граф name отстал от текущего git-состояния рабочего дерева.
+
+    Состояния: fresh | dirty | behind | diverged | unknown. live_root — дерево, с
+    которым сравниваем (cwd-проект для MCP; meta.root как fallback для CLI).
+    """
+    meta = load_meta().get(name)
+    if not meta or not meta.get("commit"):
+        return {"state": "unknown", "reason": "no_meta", "graph": meta or {}}
+    root = Path(live_root) if live_root else Path(meta.get("root") or project_root())
+    live = git_info(root)
+    if not live:
+        return {"state": "unknown", "reason": "not_git", "graph": meta, "live": None}
+    gc = meta["commit"]
+    if live["commit"] == gc:
+        return {"state": "dirty" if live["dirty"] else "fresh",
+                "behind": 0, "graph": meta, "live": live}
+    anc = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", gc, "HEAD"],
+                         capture_output=True).returncode == 0
+    if not anc:
+        return {"state": "diverged", "graph": meta, "live": live}
+    n = subprocess.run(["git", "-C", str(root), "rev-list", "--count", f"{gc}..HEAD"],
+                       capture_output=True, text=True).stdout.strip()
+    try:
+        behind = int(n)
+    except ValueError:
+        behind = None
+    return {"state": "behind", "behind": behind, "graph": meta, "live": live}
+
+
+def freshness_line(name: str, live_root=None) -> str:
+    """Однострочная шапка свежести для каждого ответа инструментов."""
+    f = graph_freshness(name, live_root)
+    st = f["state"]
+    short = (f.get("graph") or {}).get("short") or "?"
+    if st == "fresh":
+        return f"граф @ {short} · свежий"
+    if st == "dirty":
+        return f"⚠ граф @ {short} · рабочее дерево изменено (граф не видит несохранённого)"
+    if st == "behind":
+        n = f.get("behind")
+        dirty = (f.get("live") or {}).get("dirty")
+        tail = " · дерево грязное" if dirty else ""
+        return f"⚠ граф @ {short} · HEAD +{n if n is not None else '?'} коммит(ов){tail} — перезалей `grafit load`"
+    if st == "diverged":
+        return f"⚠ граф @ {short} · другая ветка/история — перезалей `grafit load`"
+    if f.get("reason") == "not_git":
+        return f"граф @ {short} (вне git — свежесть не отслеживается)"
+    return "граф без метки свежести (залит старой версией — перезалей `grafit load`)"
+
+
+def freshness_report(name: str, live_root=None) -> str:
+    """Многострочный отчёт свежести для `grafit status` / grafit_status."""
+    f = graph_freshness(name, live_root)
+    m = f.get("graph") or {}
+    head = (f"граф '{name}'  ({m.get('model', '?')}, "
+            f"{m.get('nodes', '?')} узлов / {m.get('edges', '?')} рёбер)")
+    if not m:
+        return head + "\n  нет метаданных сборки — перезалей: grafit load"
+    built = m.get("built_at", "?")
+    short = m.get("short", "?")
+    branch = m.get("branch", "?")
+    lines = [head, f"  построен:  {built}  на коммите {short} ({branch})"]
+    if m.get("dirty_at_build"):
+        lines.append("  внимание:  дерево было ГРЯЗНЫМ при сборке (часть правок не в графе)")
+    live = f.get("live")
+    st = f["state"]
+    if st == "fresh":
+        lines.append(f"  сейчас:    HEAD = {short} · совпадает, дерево чистое")
+        lines.append("  вывод:     граф свежий ✓")
+    elif st == "dirty":
+        lines.append(f"  сейчас:    HEAD = {short} · совпадает, но дерево грязное  ⚠")
+        lines.append("  вывод:     закоммить и перезалей, либо граф не видит правок: grafit load")
+    elif st == "behind":
+        ls = live.get("short", "?") if live else "?"
+        lb = live.get("branch", "?") if live else "?"
+        warn = " · дерево грязное  ⚠" if (live or {}).get("dirty") else ""
+        lines.append(f"  сейчас:    HEAD = {ls} ({lb}) · +{f.get('behind')} коммита(ов){warn}")
+        lines.append("  вывод:     граф устарел — перезалей: grafit load")
+    elif st == "diverged":
+        ls = live.get("short", "?") if live else "?"
+        lines.append(f"  сейчас:    HEAD = {ls} · не потомок коммита сборки (ребейз/смена ветки)  ⚠")
+        lines.append("  вывод:     история разошлась — перезалей: grafit load")
+    else:
+        lines.append("  сейчас:    вне git — свежесть не отслеживается")
+    return "\n".join(lines)
 
 
 def embed_url() -> str | None:
@@ -316,6 +451,43 @@ def is_test_path(sf: str | None) -> bool:
         if p in ("tests", "test") or p.endswith("-tests") or p.endswith("-test") or p.endswith(".tests"):
             return True
     return False
+
+
+# Структурные связи (извлечены из AST — высокое доверие) vs выводные (по смыслу/LLM).
+STRUCTURAL_RELATIONS = {
+    "calls", "references", "method", "contains", "imports", "imports_from",
+    "implements", "inherits", "defines", "re_exports",
+}
+
+
+def relation_kind(rel: str | None) -> str:
+    """'structural' (AST, высокое доверие) или 'inferred' (выводная связь по смыслу)."""
+    return "structural" if (rel or "").lower() in STRUCTURAL_RELATIONS else "inferred"
+
+
+# Пути сгенерированного/несемантического кода для режима prod (#7).
+_NONPROD_PARTS = ("migrations", "obj", "bin", "node_modules", "dist", "__generated__")
+
+
+def kind_matches(sf: str | None, ft: str | None, kind: str) -> bool:
+    """Подходит ли узел под режим фильтра: all|code|tests|docs|prod."""
+    if kind == "all":
+        return True
+    is_test = is_test_path(sf)
+    if kind == "tests":
+        return is_test
+    if kind == "docs":
+        return (ft or "") in ("document", "concept", "rationale")
+    if kind == "code":
+        return (ft or "") == "code" and not is_test
+    if kind == "prod":
+        if (ft or "") != "code" or is_test:
+            return False
+        s = (sf or "").lower()
+        if ".generated." in s:
+            return False
+        return not any(p in s.split("/") for p in _NONPROD_PARTS)
+    return True
 
 
 def node_text(n: dict, comm_labels: dict, root=None, cache=None, snippets=True) -> str:

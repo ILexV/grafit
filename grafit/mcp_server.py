@@ -32,6 +32,19 @@ def _graph(project: str | None):
     return common.connect(HOST, PORT).select_graph(name), name
 
 
+def _fresh(name: str, project: str | None) -> str:
+    """Шапка свежести. Без явного project сравниваем с git-деревом cwd клиента."""
+    live = None if project else common.project_root()
+    return common.freshness_line(name, live_root=live)
+
+
+def _nb(rel, mlabel, msf) -> str:
+    """Соседняя связь с меткой уверенности: structural (─ →) vs inferred (⋯ → … (inferred))."""
+    if common.relation_kind(rel) == "structural":
+        return f"  ─ {rel} → {mlabel} ({msf})"
+    return f"  ⋯ {rel} → {mlabel} ({msf}) (inferred)"
+
+
 try:
     from mcp.server.fastmcp import FastMCP
 except Exception as ex:  # pragma: no cover
@@ -42,25 +55,26 @@ mcp = FastMCP("grafit")
 
 @mcp.tool()
 def grafit_search(question: str, k: int = 8, project: str = "", neighbors: int = 4,
-                  hybrid: bool = False, rerank: bool = False) -> str:
+                  hybrid: bool = False, rerank: bool = False, kind: str = "all") -> str:
     """Семантический поиск по кодовой базе проекта (граф знаний). Возвращает наиболее
     релевантные узлы с цитатами path:line и соседями по графу.
 
     question: вопрос на естественном языке (RU/EN).
     project:  имя графа проекта (по умолчанию определяется из текущей папки).
+    kind:     фильтр узлов — all|code|tests|docs|prod (prod = код без тестов/миграций/генерёнки).
     hybrid/rerank: опц. лексика+RRF / кросс-энкодер (по бенчмаркам прироста не дают)."""
     qvec, _ = _embed(question)
     g, name = _graph(project or None)
     reranker = search.get_reranker(threads=THREADS)[0] if rerank else None
-    rows = search.search(g, qvec, question, k=k, hybrid=hybrid, reranker=reranker)
+    rows = search.search(g, qvec, question, k=k, hybrid=hybrid, reranker=reranker, kind=kind)
     if not rows:
-        return f"[{name}] ничего не найдено (залит ли проект? `grafit load`)"
-    out = [f"[{name}] {question}"]
+        return f"{_fresh(name, project or None)}\n[{name}] ничего не найдено (залит ли проект? `grafit load`)"
+    out = [_fresh(name, project or None), f"[{name}] {question}"]
     for nid, label, ft, sf, loc, clabel, text, score in rows:
         tag = " [test]" if common.is_test_path(sf) else ""
         out.append(f"\n● {label} ({ft}){tag}\n  {sf}:{loc}  | community: {clabel}")
         for rel, mlabel, msf in search.neighbors(g, nid, neighbors):
-            out.append(f"    ─ {rel} → {mlabel} ({msf})")
+            out.append("  " + _nb(rel, mlabel, msf))
     return "\n".join(out)
 
 
@@ -85,11 +99,12 @@ def grafit_explain(symbol: str, project: str = "", neighbors: int = 10) -> str:
         "ORDER BY CASE WHEN toLower(n.label) = toLower($s) THEN 0 ELSE 1 END LIMIT 1",
         params={"s": symbol}).result_set
     if not rs:
-        return f"[{name}] узел '{symbol}' не найден"
+        return f"{_fresh(name, project or None)}\n[{name}] узел '{symbol}' не найден"
     nid, label, ft, sf, loc = rs[0]
-    out = [f"[{name}] {label} ({ft})\n  {sf}:{loc}"]
+    match = "точное совпадение" if (label or "").lower() == symbol.lower() else "по подстроке"
+    out = [_fresh(name, project or None), f"[{name}] {label} ({ft}) — {match}\n  {sf}:{loc}"]
     for rel, mlabel, msf in search.neighbors(g, nid, neighbors):
-        out.append(f"  ─ {rel} → {mlabel} ({msf})")
+        out.append(_nb(rel, mlabel, msf))
     return "\n".join(out)
 
 
@@ -105,9 +120,10 @@ def grafit_find_path(source: str, target: str, project: str = "", max_hops: int 
                      params={"s": s}).result_set
         return rs[0][0] if rs else None
 
+    fresh = _fresh(name, project or None)
     a, b = resolve(source), resolve(target)
     if not a or not b:
-        return f"[{name}] не найдено: {source if not a else target}"
+        return f"{fresh}\n[{name}] не найдено: {source if not a else target}"
     # FalkorDB: shortestPath только в WITH/RETURN и ТОЛЬКО направленный. Пробуем оба
     # направления (a→b и a←b) и берём кратчайший — покрывает монотонные по направлению цепи.
     h = int(max_hops)
@@ -120,8 +136,17 @@ def grafit_find_path(source: str, target: str, project: str = "", max_hops: int 
         if rs and rs[0][0]:
             found.append(rs[0][0])
     if not found:
-        return f"[{name}] путь {source} → {target} не найден (≤{max_hops} шагов, по направлению рёбер)"
-    return f"[{name}] " + "  →  ".join(min(found, key=len))
+        return f"{fresh}\n[{name}] путь {source} → {target} не найден (≤{max_hops} шагов, по направлению рёбер)"
+    return f"{fresh}\n[{name}] " + "  →  ".join(min(found, key=len))
+
+
+@mcp.tool()
+def grafit_status(project: str = "") -> str:
+    """Свежесть графа: на каком git-коммите построен, насколько отстал от HEAD, грязно ли
+    дерево. Зови перед тем, как доверять результатам поиска по большому/давнему проекту."""
+    name = common.graph_name(project or None)
+    live = None if project else common.project_root()
+    return common.freshness_report(name, live_root=live)
 
 
 def main():

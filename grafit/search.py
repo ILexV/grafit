@@ -56,9 +56,11 @@ def _lexical(graph, question, cand):
 
 
 def search(graph, qvec, question, k=8, cand=60, test_penalty=0.5,
-           drop_generic=True, reranker=None, hybrid=False, rrf_c=60, lex_weight=0.4):
-    vec_rows = graph.query(_VEC_Q, params={"cand": cand, "q": qvec}).result_set
-    lex_rows = _lexical(graph, question, cand) if hybrid else []
+           drop_generic=True, reranker=None, hybrid=False, rrf_c=60, lex_weight=0.4, kind="all"):
+    # при фильтре по режиму берём больше кандидатов — иначе фильтр «съест» top-k
+    vcand = max(cand, k * 8) if kind != "all" else cand
+    vec_rows = graph.query(_VEC_Q, params={"cand": vcand, "q": qvec}).result_set
+    lex_rows = _lexical(graph, question, vcand) if hybrid else []
     if not vec_rows and not lex_rows:
         return []
 
@@ -68,7 +70,9 @@ def search(graph, qvec, question, k=8, cand=60, test_penalty=0.5,
     for r in lex_rows:
         by_id.setdefault(r[0], r)
 
-    ids = [nid for nid in by_id if not (drop_generic and common.is_generic(by_id[nid][1]))]
+    ids = [nid for nid in by_id
+           if not (drop_generic and common.is_generic(by_id[nid][1]))
+           and common.kind_matches(by_id[nid][3], by_id[nid][2], kind)]
     if not ids:
         ids = list(by_id)
     idset = set(ids)

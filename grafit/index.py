@@ -145,5 +145,15 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
 
     cnt = g_db.query("MATCH (n:Entity) RETURN count(n)").result_set[0][0]
     rel = g_db.query("MATCH ()-[r:LINK]->() RETURN count(r)").result_set[0][0]
+
+    # метка свежести: на каком git-коммите построен граф (для grafit status / шапки ответов)
+    gi = common.git_info(root) or {}
+    common.save_meta(name, commit=gi.get("commit"), short=gi.get("short"),
+                     committed_at=gi.get("committed_at"), branch=gi.get("branch"),
+                     dirty_at_build=gi.get("dirty"), built_at=common.now_iso(),
+                     root=str(root), nodes=cnt, edges=rel, model=model_name)
+    if gi.get("dirty"):
+        print("⚠ рабочее дерево грязное — граф отражает закоммиченное + несохранённые правки на диске")
+
     print(f"✓ граф '{name}': {cnt} узлов, {rel} рёбер. Готово.")
     return {"graph": name, "nodes": cnt, "edges": rel, "dim": dim, "model": model_name}

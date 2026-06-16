@@ -112,6 +112,23 @@ def _list(args):
         print(f"  • {g:30} {reg.get(g, '(нет в реестре)')}")
 
 
+def _status(args):
+    if args.all:
+        names = sorted(common.load_meta().keys()) or sorted(common.list_graphs(args.host, args.port))
+        if not names:
+            print("нет графов с метаданными — перезалей: grafit load"); return
+        for i, name in enumerate(names):
+            # для чужого графа сравниваем с его meta.root (live_root=None), не с cwd
+            print(common.freshness_report(name))
+            if i < len(names) - 1:
+                print()
+        return
+    # без --all: текущий проект (по cwd), сравнение с рабочим деревом cwd
+    name = common.graph_name(args.graph)
+    live = None if args.graph else common.project_root()
+    print(common.freshness_report(name, live_root=live))
+
+
 def _query(args):
     from . import search
     cfg = common.load_config()
@@ -127,18 +144,22 @@ def _query(args):
     rows = search.search(g, qvec, args.question, k=args.k, cand=args.cand,
                          test_penalty=args.test_penalty, hybrid=args.hybrid,
                          lex_weight=args.lex_weight, drop_generic=not args.no_generic_filter,
-                         reranker=reranker)
+                         reranker=reranker, kind=args.kind)
+    fresh = common.freshness_line(name, live_root=(None if args.graph else common.project_root()))
     if not rows:
-        print(f"граф '{name}': ничего не найдено (залит ли проект?)"); return
+        print(f"{fresh}\nграф '{name}': ничего не найдено (залит ли проект?)"); return
     mode = ("гибрид" if args.hybrid else "вектор") + (f"+реранк:{rname}" if reranker else "")
-    print(f"[{name}] {args.question}   ({mode})\n{'=' * 70}")
+    mode += f", kind={args.kind}" if args.kind != "all" else ""
+    print(f"{fresh}\n[{name}] {args.question}   ({mode})\n{'=' * 70}")
     for nid, label, ft, sf, loc, clabel, text, score in rows:
         tag = " ·тест" if common.is_test_path(sf) else ""
         print(f"\n● {label}  ({ft}){tag}")
         if sf:
             print(f"   {sf}:{loc}   сообщество: {clabel}")
         for rel, mlabel, msf in search.neighbors(g, nid, args.neighbors):
-            print(f"     ─ {rel} → {mlabel}  ({msf})")
+            mark = "─" if common.relation_kind(rel) == "structural" else "⋯"
+            inf = "" if common.relation_kind(rel) == "structural" else "  (inferred)"
+            print(f"     {mark} {rel} → {mlabel}  ({msf}){inf}")
 
 
 def _eval(args):
@@ -176,9 +197,16 @@ def main():
 
     p = sub.add_parser("list", help="графы проектов"); p.set_defaults(fn=_list)
 
+    p = sub.add_parser("status", help="свежесть графа (на каком коммите построен, отстал ли от HEAD)")
+    p.add_argument("--graph", default=None, help="имя графа (по умолч. из cwd)")
+    p.add_argument("--all", action="store_true", help="отчёт по всем графам с метаданными")
+    p.set_defaults(fn=_status)
+
     p = sub.add_parser("query", help="семантический поиск по коду")
     p.add_argument("question")
     p.add_argument("-k", type=int, default=8); p.add_argument("--neighbors", type=int, default=6)
+    p.add_argument("--kind", choices=["all", "code", "tests", "docs", "prod"], default="all",
+                   help="фильтр узлов: code|tests|docs|prod (prod=код без тестов/миграций/генерёнки)")
     p.add_argument("--cand", type=int, default=60)
     p.add_argument("--test-penalty", type=float, default=0.5)
     p.add_argument("--hybrid", action="store_true", help="вектор+лексика (RRF), opt-in")
