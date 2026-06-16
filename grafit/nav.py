@@ -228,27 +228,37 @@ def _conv_names(label: str) -> list[tuple[str, str]]:
     return out
 
 
-def convention_links(graph, label: str) -> list[dict]:
-    """Существующие узлы, связанные с label по конвенции имён (точное имя, без LLM/graphify)."""
+def convention_links(graph, label: str, canonical: bool = False) -> list[dict]:
+    """Существующие узлы, связанные с label по конвенции имён (точное имя, без LLM/graphify).
+
+    canonical=True сворачивает цель к ОПРЕДЕЛЕНИЮ: для display (impact/tests) `*Handler`
+    handles только каноническую `*Command`, не её reference-фрагменты в controller/validator.
+    Для bridging (поиск путей) остаётся False — там нужны file-scoped инстансы цели.
+    """
     cands = _conv_names(label)
     if not cands:
         return []
     names = list({t for _, t in cands})
     rs = graph.query(
         "MATCH (n:Entity) WHERE n.label IN $names "
-        "RETURN n.id, n.label, n.file_type, n.source_file",
+        "RETURN n.id, n.label, n.file_type, n.source_file, n.source_location",
         params={"names": names}).result_set
+    relmap = _rel_map(graph, [r[0] for r in rs]) if canonical else {}
     bylabel: dict = {}
-    for nid, lbl, ft, sf in rs:
-        bylabel.setdefault(lbl, []).append({"id": nid, "label": lbl, "file_type": ft, "source_file": sf})
+    for nid, lbl, ft, sf, loc in rs:
+        bylabel.setdefault(lbl, []).append((nid, lbl, ft, sf, loc))
     out, seen = [], set()
     self_bare = _bare(label)
     for rel, tgt in cands:
-        for n in bylabel.get(tgt, []):
-            if _bare(n["label"]) == self_bare or n["id"] in seen:
+        nodes = bylabel.get(tgt, [])
+        if canonical:  # отбросить reference-фрагменты/стабы; если определения нет — не теряем связь
+            defs = [c for c in nodes if not _is_fragment(c, relmap)]
+            nodes = defs or nodes
+        for nid, lbl, ft, sf, _loc in nodes:
+            if _bare(lbl) == self_bare or nid in seen:
                 continue
-            seen.add(n["id"])
-            out.append({"rel": rel, **n})
+            seen.add(nid)
+            out.append({"rel": rel, "id": nid, "label": lbl, "file_type": ft, "source_file": sf})
     return out
 
 
@@ -323,7 +333,7 @@ def format_tests(graph, name: str, symbol: str, max_hops: int = 2) -> list[str]:
     for sf, t in byfile.items():
         out.append(f"  ─ {t['rel']} ({t['hop']} hop)  {t['label']}  ({sf})")
     # convention: класс XTests, даже если ребра в графе нет
-    conv = [c for c in convention_links(graph, r["label"])
+    conv = [c for c in convention_links(graph, r["label"], canonical=True)
             if c["rel"] == "tested_by" and c["source_file"] not in byfile]
     for c in conv:
         out.append(f"  ⋯ tested_by (by naming)  {c['label']}  ({c['source_file']})")
@@ -358,7 +368,7 @@ def format_impact(graph, name: str, symbol: str, max_hops: int = 2) -> list[str]
     # convention: ломаются по конвенции (handler у Command, impl у интерфейса, XTests),
     # даже если ребра в графе нет
     seen_ids = {d["id"] for d in deps}
-    conv = [c for c in convention_links(graph, r["label"]) if c["id"] not in seen_ids]
+    conv = [c for c in convention_links(graph, r["label"], canonical=True) if c["id"] not in seen_ids]
     if conv:
         out.append("по конвенции (by naming):")
         for c in conv:
