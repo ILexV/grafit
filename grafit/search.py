@@ -22,8 +22,8 @@ _LEX_Q = (f"CALL db.idx.fulltext.queryNodes('Entity', $q) "
 
 
 def get_embedder(cfg, threads=4):
-    from fastembed import TextEmbedding
-    return TextEmbedding(model_name=cfg["model"], threads=threads)
+    # Общий сервис эмбеддингов (один контейнер на всех), иначе локальный fastembed.
+    return common.make_embedder(cfg["model"], threads=threads)
 
 
 def embed_query(model, cfg, question):

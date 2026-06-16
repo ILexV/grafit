@@ -17,7 +17,10 @@ classifiers = [
   "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-  "fastembed>=0.4",
+  # fastembed ЗАПИНЕН точно: вектора зависят от версии реализации (напр. CLS→mean pooling
+  # для e5). Должна совпадать с PINNED_FASTEMBED в grafit/cli.py и Dockerfile.embed —
+  # иначе фоллбэк-эмбеддер выдаст вектора, несовместимые с индексом. Сменил → load --no-cache.
+  "fastembed==0.8.0",
   "falkordb>=1.0",
   "numpy>=1.21",
   "mcp>=1.0",

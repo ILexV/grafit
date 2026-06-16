@@ -68,22 +68,31 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
             missing[h] = t
     reused = sum(1 for h in hashes if h in emb_cache)
     print(f"эмбеддинги: из кэша {reused}, считаю заново {len(missing)} из {len(embed_texts)}")
+    fe_used = None
     if missing:
-        # модель грузим ТОЛЬКО при промахах; threads/parallel ограничивают RAM onnxruntime
+        # эмбеддер ТОЛЬКО при промахах: общий сервис (модель в RAM один раз) или локальный
+        # fastembed; threads/parallel ограничивают RAM onnxruntime в локальном режиме
         os.environ.setdefault("OMP_NUM_THREADS", str(threads))
-        from fastembed import TextEmbedding
         try:
-            emb = TextEmbedding(model_name=model_name, threads=threads)
+            emb = common.make_embedder(model_name, threads=threads)
         except Exception as ex:
-            sys.exit(f"модель '{model_name}' недоступна в fastembed: {ex}")
+            sys.exit(f"модель '{model_name}' недоступна: {ex}")
         for h, v in zip(missing.keys(),
                         emb.embed(list(missing.values()), batch_size=batch, parallel=None)):
             emb_cache[h] = v
+        # версия fastembed, которой реально посчитаны новые вектора (эталон для make_embedder)
+        if isinstance(emb, common.RemoteEmbedder):
+            fe_used = (common._probe_embed(common.embed_url() or "") or {}).get("fastembed")
+        else:
+            fe_used = common.fastembed_version()
     common.save_emb_cache(model_name, emb_cache)
+    if fe_used:
+        common.update_config(fastembed=fe_used)
     embs = [list(emb_cache[h]) for h in hashes]
     dim = len(embs[0])
     if not cfg or switching:
-        common.save_config({"model": model_name, "dim": dim, "is_e5": is_e5})
+        # merge: не затереть embed_url, если общий сервис уже сконфигурирован
+        common.update_config(model=model_name, dim=dim, is_e5=is_e5)
     elif cfg.get("dim") != dim:
         sys.exit(f"размерность {dim} != config {cfg.get('dim')}; перезапусти с --model.")
 

@@ -81,6 +81,101 @@ def save_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
 
 
+def update_config(**kw) -> dict:
+    """Слить ключи в config.json, не затирая остальные (напр. embed_url ↔ model/dim)."""
+    cfg = load_config() or {}
+    cfg.update({k: v for k, v in kw.items() if v is not None})
+    save_config(cfg)
+    return cfg
+
+
+def embed_url() -> str | None:
+    """URL общего сервиса эмбеддингов: env GRAFIT_EMBED_URL приоритетнее config.json."""
+    url = os.environ.get("GRAFIT_EMBED_URL")
+    if url:
+        return url.rstrip("/")
+    cfg = load_config() or {}
+    u = cfg.get("embed_url")
+    return u.rstrip("/") if u else None
+
+
+class RemoteEmbedder:
+    """Клиент grafit-embed: тот же интерфейс .embed(texts), что у fastembed.TextEmbedding.
+
+    Векторы считает общий контейнер (модель в RAM один раз). urllib — без лишних
+    клиентских зависимостей. Возвращает numpy-массивы (нужен .tolist() в search).
+    """
+
+    def __init__(self, url: str, model: str, timeout: float = 300.0):
+        self.url = url.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+
+    def embed(self, texts, batch_size: int = 64, parallel=None, **_):
+        import json as _json
+        import urllib.request
+
+        import numpy as np
+        texts = list(texts)
+        for i in range(0, len(texts), batch_size):
+            chunk = texts[i:i + batch_size]
+            payload = _json.dumps({"texts": chunk, "batch_size": batch_size}).encode("utf-8")
+            req = urllib.request.Request(
+                self.url + "/embed", data=payload,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                data = _json.loads(r.read())
+            for v in data["embeddings"]:
+                yield np.asarray(v, dtype="float32")
+
+
+def _probe_embed(url: str, timeout: float = 3.0) -> dict | None:
+    """GET /health общего сервиса. None, если недоступен."""
+    import json as _json
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=timeout) as r:
+            return _json.loads(r.read())
+    except Exception:
+        return None
+
+
+def fastembed_version() -> str | None:
+    try:
+        import fastembed
+        return getattr(fastembed, "__version__", None)
+    except Exception:
+        return None
+
+
+def make_embedder(model_name: str, threads: int = 4):
+    """Общий сервис эмбеддингов, если он сконфигурирован и совместим; иначе локальный fastembed.
+
+    Безопасность векторов: remote используется ТОЛЬКО если совпадают и модель, и версия
+    fastembed (вектора зависят от реализации — напр. CLS↔mean pooling между версиями).
+    Эталон версии — config['fastembed'] (версия, на которой собран индекс). При
+    недоступности/несовпадении честно предупреждаем и грузим модель локально.
+    """
+    url = embed_url()
+    if url:
+        health = _probe_embed(url)
+        cfg = load_config() or {}
+        want_fe = cfg.get("fastembed")
+        if health is None:
+            print(f"⚠ grafit-embed {url} недоступен — гружу модель локально "
+                  f"(подними сервис: `grafit up`)")
+        elif health.get("model") != model_name:
+            print(f"⚠ grafit-embed отдаёт модель '{health.get('model')}', а нужна "
+                  f"'{model_name}' — векторы бы не сошлись; гружу локально")
+        elif want_fe and health.get("fastembed") and health["fastembed"] != want_fe:
+            print(f"⚠ grafit-embed на fastembed {health['fastembed']}, индекс собран на "
+                  f"{want_fe} — вектора не сойдутся; гружу локально (или перезалей `--no-cache`)")
+        else:
+            return RemoteEmbedder(url, model_name)
+    from fastembed import TextEmbedding
+    return TextEmbedding(model_name=model_name, threads=threads)
+
+
 def pick_model() -> str:
     from fastembed import TextEmbedding
     supported = {m["model"] for m in TextEmbedding.list_supported_models()}

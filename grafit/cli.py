@@ -1,6 +1,7 @@
 """grafit CLI: up | down | load | query | eval | list | mcp."""
 from __future__ import annotations
-import argparse, subprocess, sys
+import argparse, shutil, subprocess, sys
+from pathlib import Path
 
 from . import common
 
@@ -9,12 +10,75 @@ IMAGE = "falkordb/falkordb:latest"
 DEFAULT_PORT = 6399   # уникальный хост-порт (6379 занят прочими FalkorDB)
 UI_PORT = 6400
 
+# Общий сервис эмбеддингов: модель в RAM один раз, отвечает всем агентам по HTTP.
+EMBED_CONTAINER = "grafit-embed"
+EMBED_IMAGE = "grafit-embed:local"
+EMBED_PORT = 6401     # уникальный хост-порт (HTTP /embed, /health), только localhost
+DEFAULT_EMBED_MODEL = "intfloat/multilingual-e5-large"
+# Версия fastembed фиксируется ЖЁСТКО: вектора зависят не от имени модели, а от
+# реализации (пример — смена CLS→mean pooling для e5 между версиями). Должна совпадать
+# с пином в pyproject.toml и Dockerfile.embed. Сменил — перезалей проекты `--no-cache`.
+PINNED_FASTEMBED = "0.8.0"
+
+_DOCKERFILE_EMBED = f"""\
+FROM python:3.12-slim
+WORKDIR /app
+RUN pip install --no-cache-dir "fastembed=={PINNED_FASTEMBED}" fastapi "uvicorn[standard]"
+ARG EMBED_MODEL=intfloat/multilingual-e5-large
+ENV GRAFIT_EMBED_MODEL=${{EMBED_MODEL}}
+# Запекаем модель в образ ДО COPY сервера: правки server.py не триггерят пере-скачивание.
+RUN python -c "import os; from fastembed import TextEmbedding; TextEmbedding(model_name=os.environ['GRAFIT_EMBED_MODEL'])"
+COPY server.py /app/server.py
+EXPOSE 8080
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]
+"""
+
+
+def _container_exists(name: str) -> bool:
+    return bool(subprocess.run(["docker", "ps", "-aq", "-f", f"name=^{name}$"],
+                               capture_output=True, text=True).stdout.strip())
+
+
+def _image_exists(ref: str) -> bool:
+    return bool(subprocess.run(["docker", "images", "-q", ref],
+                               capture_output=True, text=True).stdout.strip())
+
+
+def _build_embed_image(model: str):
+    """Собрать образ grafit-embed из standalone embed_server.py (контекст в ~/.grafit)."""
+    # Путь к standalone-серверу без import (он тянет fastapi, которого нет в окружении тула).
+    src = Path(__file__).resolve().parent / "embed_server.py"
+    bd = common.HOME / "embed-build"
+    bd.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, bd / "server.py")
+    (bd / "Dockerfile").write_text(_DOCKERFILE_EMBED, encoding="utf-8")
+    print(f"собираю образ {EMBED_IMAGE} (модель {model} запекается — это разово, ~несколько минут)…")
+    subprocess.run(["docker", "build", "-t", EMBED_IMAGE,
+                    "--build-arg", f"EMBED_MODEL={model}", str(bd)], check=True)
+
+
+def _up_embed(model: str, rebuild: bool):
+    if rebuild and _container_exists(EMBED_CONTAINER):
+        subprocess.run(["docker", "rm", "-f", EMBED_CONTAINER])
+    if _container_exists(EMBED_CONTAINER) and not rebuild:
+        subprocess.run(["docker", "start", EMBED_CONTAINER])
+    else:
+        if rebuild or not _image_exists(EMBED_IMAGE):
+            _build_embed_image(model)
+        subprocess.run([
+            "docker", "run", "-d", "--name", EMBED_CONTAINER, "--restart", "unless-stopped",
+            "-p", f"127.0.0.1:{EMBED_PORT}:8080",
+            "-e", f"GRAFIT_EMBED_MODEL={model}",
+            "-v", "grafit-embed-cache:/root/.cache/fastembed",
+            EMBED_IMAGE])
+    url = f"http://127.0.0.1:{EMBED_PORT}"
+    common.update_config(embed_url=url)
+    print(f"grafit-embed '{EMBED_CONTAINER}' на {url}  (модель {model}, embed_url прописан в config)")
+
 
 def _up(args):
     # Идемпотентно: если контейнер есть — стартуем, иначе создаём.
-    exists = subprocess.run(["docker", "ps", "-aq", "-f", f"name=^{CONTAINER}$"],
-                            capture_output=True, text=True).stdout.strip()
-    if exists:
+    if _container_exists(CONTAINER):
         subprocess.run(["docker", "start", CONTAINER])
     else:
         subprocess.run([
@@ -22,10 +86,16 @@ def _up(args):
             "-p", f"127.0.0.1:{args.port}:6379", "-p", f"127.0.0.1:{UI_PORT}:3000",
             "-v", "grafit-falkordb:/data", IMAGE])
     print(f"FalkorDB '{CONTAINER}' на 127.0.0.1:{args.port} (UI :{UI_PORT})")
+    if args.no_embed:
+        print("grafit-embed пропущен (--no-embed) — модель будет грузиться в каждый процесс локально")
+        return
+    cfg = common.load_config() or {}
+    model = args.embed_model or cfg.get("model") or DEFAULT_EMBED_MODEL
+    _up_embed(model, rebuild=args.rebuild_embed)
 
 
 def _down(args):
-    subprocess.run(["docker", "stop", CONTAINER])
+    subprocess.run(["docker", "stop", EMBED_CONTAINER, CONTAINER])
 
 
 def _load(args):
@@ -88,8 +158,12 @@ def main():
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("up", help="поднять FalkorDB (docker)"); p.set_defaults(fn=_up)
-    p = sub.add_parser("down", help="остановить FalkorDB"); p.set_defaults(fn=_down)
+    p = sub.add_parser("up", help="поднять FalkorDB + общий сервис эмбеддингов (docker)")
+    p.add_argument("--no-embed", action="store_true", help="не поднимать grafit-embed (модель локально в каждом процессе)")
+    p.add_argument("--embed-model", default=None, help=f"модель для grafit-embed (по умолч. из config или {DEFAULT_EMBED_MODEL})")
+    p.add_argument("--rebuild-embed", action="store_true", help="пересобрать образ grafit-embed (смена модели)")
+    p.set_defaults(fn=_up)
+    p = sub.add_parser("down", help="остановить FalkorDB + grafit-embed"); p.set_defaults(fn=_down)
 
     p = sub.add_parser("load", help="проиндексировать проект")
     p.add_argument("path", nargs="?", default=None, help="корень проекта (по умолч. cwd)")

@@ -1,5 +1,5 @@
-# Альтернатива `grafit up` — поднять FalkorDB через compose.
-# docker compose up -d
+# Альтернатива `grafit up` — поднять весь стек grafit через compose (из корня репо).
+# docker compose up -d --build
 services:
   falkordb:
     image: falkordb/falkordb:latest
@@ -16,5 +16,32 @@ services:
       timeout: 3s
       retries: 10
 
+  # Общий сервис эмбеддингов: модель грузится ОДИН раз, отвечает всем агентам по HTTP.
+  # Убирает N×копий модели в RAM (по копии на каждый MCP-процесс). Векторы идентичны
+  # локальному fastembed — переиндексация не нужна. embed_url пропиши в ~/.grafit/config.json
+  # (`grafit up` делает это сам) или задай GRAFIT_EMBED_URL=http://127.0.0.1:6401 клиентам.
+  embed:
+    build:
+      context: .
+      dockerfile: Dockerfile.embed
+      args:
+        EMBED_MODEL: intfloat/multilingual-e5-large
+    image: grafit-embed:local
+    container_name: grafit-embed
+    environment:
+      GRAFIT_EMBED_MODEL: intfloat/multilingual-e5-large
+    ports:
+      - "127.0.0.1:6401:8080"   # HTTP /embed, /health — только локально
+    volumes:
+      - grafit-embed-cache:/root/.cache/fastembed
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if b'\"status\": \"ok\"' in urllib.request.urlopen('http://localhost:8080/health').read() else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
 volumes:
   grafit-falkordb:
+  grafit-embed-cache:

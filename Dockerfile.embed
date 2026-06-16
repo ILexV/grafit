@@ -1,0 +1,16 @@
+# grafit-embed — общий сервис эмбеддингов (модель в RAM один раз, отвечает всем).
+# Compose-вариант: контекст = корень репо, COPY standalone-сервера. `grafit up` собирает
+# эквивалентный образ сам (см. cli `_build_embed_image`), репо для него не нужно.
+#
+# fastembed ЗАПИНЕН: вектора зависят от версии реализации (пример — CLS→mean pooling для
+# e5). Версия обязана совпадать с PINNED_FASTEMBED в grafit/cli.py и пином в pyproject.toml.
+FROM python:3.12-slim
+WORKDIR /app
+RUN pip install --no-cache-dir "fastembed==0.8.0" fastapi "uvicorn[standard]"
+ARG EMBED_MODEL=intfloat/multilingual-e5-large
+ENV GRAFIT_EMBED_MODEL=${EMBED_MODEL}
+# Запекаем модель в образ ДО COPY сервера: правки server.py не триггерят пере-скачивание.
+RUN python -c "import os; from fastembed import TextEmbedding; TextEmbedding(model_name=os.environ['GRAFIT_EMBED_MODEL'])"
+COPY grafit/embed_server.py /app/server.py
+EXPOSE 8080
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]
