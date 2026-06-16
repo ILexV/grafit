@@ -37,6 +37,3 @@ Repository = "https://github.com/ILexV/grafit"
 
 [tool.hatch.build.targets.wheel]
 packages = ["grafit"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"grafit/data" = "grafit/data"

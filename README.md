@@ -56,6 +56,29 @@ grafit list                          # графы проектов в инста
 > прироста не дали (модель сама вбирает лексику через сниппеты) — оба **opt-in**.
 > Дефолт: чистый вектор + фильтр генериков + демоция тестов. Меряйте `grafit eval`.
 
+## Авто-обновление графа (post-commit)
+Цепочка обновления: правки кода → graphify обновляет `graphify-out/graph.json` →
+**`grafit load`** заливает его в FalkorDB → MCP видит свежие данные (без рестарта,
+коннект к БД на каждый запрос). Шаг `grafit load` можно автоматизировать в git-хуке,
+дождавшись, пока graphify допишет `graph.json`:
+
+```sh
+# .git/hooks/post-commit (после блока graphify hook)
+if command -v grafit >/dev/null 2>&1; then
+    base=$(stat -c %Y graphify-out/graph.json 2>/dev/null || echo 0)
+    nohup env DIR="$(pwd)" BASE="$base" sh -c '
+        cd "$DIR"; i=0; stable=0; prev=""
+        while [ $i -lt 150 ]; do
+            cur=$(stat -c %Y graphify-out/graph.json 2>/dev/null || echo 0)
+            [ "$cur" -gt "$BASE" ] && { [ "$cur" = "$prev" ] && stable=$((stable+1)) || stable=0; [ $stable -ge 3 ] && break; }
+            prev=$cur; i=$((i+1)); sleep 2
+        done
+        ulimit -v 8000000 2>/dev/null; grafit load
+    ' >>~/.cache/grafit-load.log 2>&1 </dev/null &
+fi
+```
+Документация (LLM-семантика) обновляется отдельно: `graphify --update` → `grafit load`.
+
 ## Порты
 grafit поднимает FalkorDB на уникальных хост-портах **6399** (данные, Redis-протокол) и
 **6400** (web-UI), привязанных к 127.0.0.1 — чтобы не конфликтовать со стандартным
