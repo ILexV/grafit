@@ -1,6 +1,7 @@
 """MCP-сервер grafit: семантический поиск по коду из любого MCP-клиента (stdio).
 
-Инструменты: grafit_search, grafit_list_projects, grafit_explain, grafit_find_path.
+Инструменты: grafit_search, grafit_list_projects, grafit_explain, grafit_find_path,
+grafit_status, grafit_tests, grafit_impact, grafit_trace.
 Эмбеддер грузится лениво (на первый запрос) и кэшируется — старт сервера лёгкий.
 Проект определяется по cwd клиента (или явным параметром project = имя графа).
 
@@ -8,7 +9,7 @@
 """
 from __future__ import annotations
 import os
-from . import common, search
+from . import common, nav, search
 
 HOST = os.environ.get("GRAFIT_HOST", "localhost")
 PORT = int(os.environ.get("GRAFIT_PORT", "6399"))
@@ -92,18 +93,16 @@ def grafit_list_projects() -> str:
 def grafit_explain(symbol: str, project: str = "", neighbors: int = 10) -> str:
     """Объяснить узел (класс/функция/концепт) по имени и его связи в графе."""
     g, name = _graph(project or None)
-    rs = g.query(
-        "MATCH (n:Entity) WHERE toLower(n.label) = toLower($s) OR n.label CONTAINS $s "
-        "RETURN n.id, n.label, n.file_type, n.source_file, n.source_location "
-        # точное совпадение имени важнее подстроки (класс ProcessVersionStateMachine, а не файл .cs)
-        "ORDER BY CASE WHEN toLower(n.label) = toLower($s) THEN 0 ELSE 1 END LIMIT 1",
-        params={"s": symbol}).result_set
-    if not rs:
-        return f"{_fresh(name, project or None)}\n[{name}] узел '{symbol}' не найден"
-    nid, label, ft, sf, loc = rs[0]
-    match = "точное совпадение" if (label or "").lower() == symbol.lower() else "по подстроке"
-    out = [_fresh(name, project or None), f"[{name}] {label} ({ft}) — {match}\n  {sf}:{loc}"]
-    for rel, mlabel, msf in search.neighbors(g, nid, neighbors):
+    fresh = _fresh(name, project or None)
+    r = nav.resolve_node(g, symbol)
+    if not r:
+        return f"{fresh}\n[{name}] узел '{symbol}' не найден"
+    match = "точное совпадение" if r["match"] == "exact" else "по подстроке"
+    hdr = f"[{name}] {r['label']} ({r['ft']}) — {match}"
+    if r["n_candidates"] > 1:
+        hdr += f" · {r['n_candidates']} кандидат(ов)" + (" ⚠ неоднозначно" if r["ambiguous"] else "")
+    out = [fresh, f"{hdr}\n  {r['sf']}:{r['loc']}"]
+    for rel, mlabel, msf in search.neighbors(g, r["id"], neighbors):
         out.append(_nb(rel, mlabel, msf))
     return "\n".join(out)
 
@@ -112,32 +111,14 @@ def grafit_explain(symbol: str, project: str = "", neighbors: int = 10) -> str:
 def grafit_find_path(source: str, target: str, project: str = "", max_hops: int = 6) -> str:
     """Кратчайший путь в графе между двумя сущностями (по именам)."""
     g, name = _graph(project or None)
-
-    def resolve(s):
-        rs = g.query("MATCH (n:Entity) WHERE toLower(n.label)=toLower($s) OR n.label CONTAINS $s "
-                     "RETURN n.id "
-                     "ORDER BY CASE WHEN toLower(n.label)=toLower($s) THEN 0 ELSE 1 END LIMIT 1",
-                     params={"s": s}).result_set
-        return rs[0][0] if rs else None
-
     fresh = _fresh(name, project or None)
-    a, b = resolve(source), resolve(target)
+    a, b = nav.resolve_node(g, source), nav.resolve_node(g, target)
     if not a or not b:
         return f"{fresh}\n[{name}] не найдено: {source if not a else target}"
-    # FalkorDB: shortestPath только в WITH/RETURN и ТОЛЬКО направленный. Пробуем оба
-    # направления (a→b и a←b) и берём кратчайший — покрывает монотонные по направлению цепи.
-    h = int(max_hops)
-    found = []
-    for arrow in (f"-[:LINK*..{h}]->", f"<-[:LINK*..{h}]-"):
-        rs = g.query(
-            f"MATCH (a:Entity {{id:$a}}), (b:Entity {{id:$b}}) "
-            f"RETURN [n IN nodes(shortestPath((a){arrow}(b))) | n.label]",
-            params={"a": a, "b": b}).result_set
-        if rs and rs[0][0]:
-            found.append(rs[0][0])
-    if not found:
+    path = nav.shortest_path(g, a["id"], b["id"], max_hops=int(max_hops))
+    if not path:
         return f"{fresh}\n[{name}] путь {source} → {target} не найден (≤{max_hops} шагов, по направлению рёбер)"
-    return f"{fresh}\n[{name}] " + "  →  ".join(min(found, key=len))
+    return f"{fresh}\n[{name}] " + "  →  ".join(path)
 
 
 @mcp.tool()
@@ -147,6 +128,35 @@ def grafit_status(project: str = "") -> str:
     name = common.graph_name(project or None)
     live = None if project else common.project_root()
     return common.freshness_report(name, live_root=live)
+
+
+@mcp.tool()
+def grafit_tests(symbol: str, project: str = "", max_hops: int = 2) -> str:
+    """Тесты, связанные с символом (функцией/классом/endpoint). Зови ПЕРЕД изменением —
+    показывает, какие тесты затрагивает правка. Обход графа, без эмбеддингов."""
+    g, name = _graph(project or None)
+    return "\n".join([_fresh(name, project or None)]
+                     + nav.format_tests(g, name, symbol, int(max_hops)))
+
+
+@mcp.tool()
+def grafit_impact(symbol: str, project: str = "", max_hops: int = 2) -> str:
+    """Impact-анализ: что сломается при изменении символа. Идёт по ВХОДЯЩИМ зависимостям
+    (кто использует X) и группирует по категориям: tests/frontend/backend/contract/docs."""
+    g, name = _graph(project or None)
+    return "\n".join([_fresh(name, project or None)]
+                     + nav.format_impact(g, name, symbol, int(max_hops)))
+
+
+@mcp.tool()
+def grafit_trace(source: str, project: str = "", max_hops: int = 4, target: str = "",
+                 with_references: bool = False) -> str:
+    """Проследить поток ВПЕРЁД от символа (endpoint → handler → service → …). Без target —
+    дерево достижимости по calls/method/contains; с target — кратчайший путь source→target.
+    with_references подмешивает шумные references-рёбра."""
+    g, name = _graph(project or None)
+    return "\n".join([_fresh(name, project or None)]
+                     + nav.format_trace(g, name, source, int(max_hops), target, with_references))
 
 
 def main():

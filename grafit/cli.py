@@ -162,6 +162,27 @@ def _query(args):
             print(f"     {mark} {rel} → {mlabel}  ({msf}){inf}")
 
 
+def _nav_cmd(args, fmt):
+    from . import nav
+    name = common.graph_name(args.graph)
+    g = common.connect(args.host, args.port).select_graph(name)
+    fresh = common.freshness_line(name, live_root=(None if args.graph else common.project_root()))
+    print("\n".join([fresh] + fmt(nav, g, name)))
+
+
+def _tests(args):
+    _nav_cmd(args, lambda nav, g, name: nav.format_tests(g, name, args.symbol, args.hops))
+
+
+def _impact(args):
+    _nav_cmd(args, lambda nav, g, name: nav.format_impact(g, name, args.symbol, args.hops))
+
+
+def _trace(args):
+    _nav_cmd(args, lambda nav, g, name: nav.format_trace(
+        g, name, args.source, args.hops, args.to or "", args.with_references))
+
+
 def _eval(args):
     from . import eval as ev
     ev.run_eval(graph=args.graph, golden=args.golden, host=args.host,
@@ -215,6 +236,22 @@ def main():
     p.add_argument("--rerank", action="store_true", help="кросс-энкодер реранкер, opt-in")
     p.add_argument("--threads", type=int, default=4); p.add_argument("--graph", default=None)
     p.set_defaults(fn=_query)
+
+    p = sub.add_parser("tests", help="тесты, связанные с символом (перед изменением)")
+    p.add_argument("symbol"); p.add_argument("--graph", default=None)
+    p.add_argument("--hops", type=int, default=2)
+    p.set_defaults(fn=_tests)
+
+    p = sub.add_parser("impact", help="что сломается при изменении символа (входящие зависимости)")
+    p.add_argument("symbol"); p.add_argument("--graph", default=None)
+    p.add_argument("--hops", type=int, default=2)
+    p.set_defaults(fn=_impact)
+
+    p = sub.add_parser("trace", help="проследить поток вперёд от символа (или путь до --to)")
+    p.add_argument("source"); p.add_argument("--to", default=None, help="цель: кратчайший путь source→target")
+    p.add_argument("--graph", default=None); p.add_argument("--hops", type=int, default=4)
+    p.add_argument("--with-references", action="store_true", help="подмешать шумные references-рёбра")
+    p.set_defaults(fn=_trace)
 
     p = sub.add_parser("eval", help="метрики поиска по золотому набору")
     p.add_argument("--graph", default=None); p.add_argument("--golden", default=None)
