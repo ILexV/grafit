@@ -309,33 +309,55 @@ def format_impact(graph, name: str, symbol: str, max_hops: int = 2) -> list[str]
     return out
 
 
-def bridged_path(graph, a: dict, b: dict, max_hops: int = 6):
-    """Путь a→b; если прямого нет — мостит через impl_of-алиасы концов (интерфейс↔impl).
+# Конвенции, по которым можно ДОСТРОИТЬ маршрут, когда прямого ребра нет:
+# interface↔impl (направление меняется на интерфейсе) и Command↔Handler (MediatR — реального
+# ребра mediator.Send(LoginCommand)→LoginCommandHandler в графе нет).
+_ROUTING_RELS = {"impl_of", "handles", "handled_by"}
+# как назвать мост в выводе для направления, в котором его проходим
+_BRIDGE_LABEL = {"impl_of": "impl_of", "handles": "handled_by", "handled_by": "handled_by"}
 
-    Кейс: Handler --references--> IFoo, но Foo --implements--> IFoo (направление меняется на
-    интерфейсе → directed shortestPath не находит). Пробуем a→I(b)/impl(b) и достраиваем
-    последний/первый переход как impl_of. Возвращает (path_labels|None, bridge_kind|None).
+
+def _route_alts(graph, node: dict) -> list[tuple]:
+    """Сам узел + его routing-алиасы по конвенции (id, label, bridge_rel|None)."""
+    alts = [(node["id"], node["label"], None)]
+    for c in convention_links(graph, node["label"]):
+        if c["rel"] in _ROUTING_RELS:
+            alts.append((c["id"], c["label"], _BRIDGE_LABEL[c["rel"]]))
+    return alts
+
+
+def bridged_path(graph, a: dict, b: dict, max_hops: int = 6):
+    """Путь a→b; если прямого нет — мостит концы через convention-алиасы (impl_of/handled_by).
+
+    Закрывает кейсы, где ребро не извлечено или меняет направление:
+      Handler→IFoo, но Foo→implements→IFoo  → мост impl_of на конце-impl;
+      AuthController→LoginCommand, но Command→Handler ребра нет → мост handled_by на конце-handler.
+    Возвращает (path_labels|None, bridge_label|None). bridge_label — типы достроенных переходов.
     """
     direct = shortest_path(graph, a["id"], b["id"], max_hops)
     if direct:
         return direct, None
-    a_alts = [(a["id"], a["label"])] + [(c["id"], c["label"])
-              for c in convention_links(graph, a["label"]) if c["rel"] == "impl_of"]
-    b_alts = [(b["id"], b["label"])] + [(c["id"], c["label"])
-              for c in convention_links(graph, b["label"]) if c["rel"] == "impl_of"]
-    best = None
-    for aid, alab in a_alts:
-        for bid, blab in b_alts:
-            if aid == a["id"] and bid == b["id"]:
-                continue  # прямой уже пробовали
+    a_alts, b_alts = _route_alts(graph, a), _route_alts(graph, b)
+    # чистый convention-хоп: алиас одного конца — это сам другой конец (Command↔Handler рядом)
+    for aid, _l, arel in a_alts:
+        if arel and aid == b["id"]:
+            return [a["label"], b["label"]], arel
+    for bid, _l, brel in b_alts:
+        if brel and bid == a["id"]:
+            return [a["label"], b["label"]], brel
+    # односторонний мост: ровно один конец заменяем алиасом (иначе получается зигзаг)
+    best = None  # (full_labels, bridge_label)
+    for aid, _l, arel in a_alts:
+        for bid, _l2, brel in b_alts:
+            if (arel is None) == (brel is None):
+                continue  # 0 или 2 алиаса — пропускаем
             p = shortest_path(graph, aid, bid, max_hops)
             if not p:
                 continue
-            full = ([a["label"]] if alab != a["label"] else []) + list(p) \
-                + ([b["label"]] if blab != b["label"] else [])
-            if best is None or len(full) < len(best):
-                best = full
-    return (best, "impl_of") if best else (None, None)
+            full = ([a["label"]] if arel else []) + list(p) + ([b["label"]] if brel else [])
+            if best is None or len(full) < len(best[0]):
+                best = (full, arel or brel)
+    return best if best else (None, None)
 
 
 def related_hint(graph, node_id: str, label: str, limit: int = 8) -> list[str]:

@@ -105,8 +105,16 @@ CLS→mean pooling между версиями). Поэтому fastembed **за
 (DI, MediatR, тест-naming). grafit добавляет их по конвенциям имён на query-time, помечая
 `(by naming)` / inferred (стор не засоряется): `X ↔ XTests` (`tested_by`),
 `XCommand/XQuery ↔ XCommandHandler` (`handled_by`/`handles`), `IFoo ↔ Foo` (`impl_of`).
-Когда прямого пути/потока нет, `trace`/`find_path` дают **fallback**: связанные символы по
-конвенциям и ближайшим references/imports вместо «не найдено».
+
+`find_path`/`trace --to` **достраивают маршрут** через эти конвенции, когда прямого ребра нет
+или оно меняет направление (помечают `(мост: <тип> by naming)`):
+- `LoginCommandHandler → IJwtTokenService → JwtTokenService` (`impl_of`: на интерфейсе
+  направление `references`↔`implements` меняется, directed shortestPath сам не пройдёт);
+- `AuthController → .Login() → LoginCommand → LoginCommandHandler` (`handled_by`: ребра
+  `mediator.Send(LoginCommand)` → handler в графе нет).
+
+Если и мост не помог, отдаётся **fallback**: связанные символы по конвенциям и ближайшим
+references/imports вместо «не найдено».
 
 ## Разделение данных между проектами
 Один FalkorDB, **один именованный граф на проект** (имя = basename git-репо, очищенное).
