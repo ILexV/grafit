@@ -29,6 +29,12 @@ dependencies = [
 [project.optional-dependencies]
 # Реранкер тянет кросс-энкодеры fastembed; функционал есть и без extra, это просто маркер.
 rerank = []
+# Тесты: чистые юнит-тесты + golden-eval навигации (golden пропускается без живого графа).
+test = ["pytest>=7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
 
 [project.scripts]
 grafit = "grafit.cli:main"
