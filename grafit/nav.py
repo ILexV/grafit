@@ -38,32 +38,76 @@ def _candidates(graph, symbol: str, limit: int = 40):
         params={"s": symbol, "lim": limit}).result_set
 
 
-def resolve_node(graph, symbol: str, limit: int = 40) -> dict | None:
-    """Найти узел по имени, предпочитая ОПРЕДЕЛЕНИЕ: точное совпадение → не-тест → код.
+# Рёбра «только потребление»: узел, у которого ВСЕ рёбра такие, — reference-фрагмент
+# (per-file дубликат символа), а не его определение.
+_REF_ONLY_RELS = {"references", "imports", "imports_from"}
 
-    Сравнение нормализованное ('.Foo()' == 'Foo()' == 'Foo'), чтобы функция/метод не
-    проигрывали одноимённой concept-доке. Возвращает dict (match, n_candidates, ambiguous).
+
+def _rel_map(graph, ids: list[str]) -> dict:
+    """id → множество типов инцидентных рёбер (обе стороны). Один запрос на пачку."""
+    if not ids:
+        return {}
+    rs = graph.query(
+        "MATCH (n:Entity)-[r:LINK]-(m:Entity) WHERE n.id IN $ids "
+        "RETURN n.id, collect(DISTINCT r.relation)", params={"ids": ids}).result_set
+    return {row[0]: set(row[1]) for row in rs}
+
+
+def _is_fragment(c, relmap: dict) -> bool:
+    """reference-фрагмент или стаб одноимённого символа (НЕ его определение).
+
+    Стаб — placeholder graphify без source_file и без loc. Фрагмент — узел, чьи рёбра
+    исключительно references/imports* (символ упомянут в чужом файле, но определён не тут).
+    """
+    _id, _label, _ft, sf, loc = c
+    if not sf and not loc:
+        return True
+    rels = relmap.get(_id, set())
+    return bool(rels) and rels <= _REF_ONLY_RELS
+
+
+def resolve_node(graph, symbol: str, limit: int = 40) -> dict | None:
+    """Найти узел по имени, предпочитая ОПРЕДЕЛЕНИЕ: точное → не-фрагмент → не-тест → код.
+
+    Сравнение нормализованное ('.Foo()' == 'Foo()' == 'Foo'). Одноимённые reference-узлы
+    (per-file дубликаты, что graphify плодит на каждый файл-потребитель) и стабы НЕ считаются
+    равноправными кандидатами с определением: они штрафуются в ранжировании и не раздувают
+    n_candidates/ambiguous. Возвращает dict (match, n_candidates, fragments, ambiguous).
     """
     rs = _candidates(graph, symbol, limit)
     if not rs:
         return None
     sn = _norm(symbol)
+    relmap = _rel_map(graph, [c[0] for c in rs])
 
     def key(c):
         _id, label, ft, sf, _loc = c
-        exact = 0 if _norm(label) == sn else 1
-        test = 1 if common.is_test_path(sf) else 0
-        return (exact, test, _FT_RANK.get(ft, 4), 0 if _loc else 1, len(sf or ""))
+        return (0 if _norm(label) == sn else 1,
+                1 if _is_fragment(c, relmap) else 0,
+                1 if common.is_test_path(sf) else 0,
+                _FT_RANK.get(ft, 4), 0 if _loc else 1, len(sf or ""))
 
     nid, label, ft, sf, loc = sorted(rs, key=key)[0]
     exact = _norm(label) == sn
-    exact_nontest = [c for c in rs if _norm(c[1]) == sn and not common.is_test_path(c[3])]
-    alternatives = [{"label": c[1], "ft": c[2], "sf": c[3]}
-                    for c in exact_nontest if c[0] != nid and c[3]][:3]
+    exact_all = [c for c in rs if _norm(c[1]) == sn]
+    if exact_all:
+        real = [c for c in exact_all if not _is_fragment(c, relmap)]
+        frags = len(exact_all) - len(real)
+        defs = [c for c in real if not common.is_test_path(c[3])]
+        alternatives = [{"label": c[1], "ft": c[2], "sf": c[3]}
+                        for c in defs if c[0] != nid and c[3]][:3]
+        n_candidates = max(1, len(real))
+        ambiguous = len(defs) > 1
+    else:  # резолв по подстроке — сохраняем прежнее поведение
+        frags = 0
+        alternatives = [{"label": c[1], "ft": c[2], "sf": c[3]}
+                        for c in rs if c[0] != nid and c[3]][:3]
+        n_candidates = len(rs)
+        ambiguous = len(rs) > 1
     return {"id": nid, "label": label, "ft": ft, "sf": sf, "loc": loc,
             "match": "exact" if exact else "substring",
-            "n_candidates": len(rs), "ambiguous": len(exact_nontest) > 1,
-            "alternatives": alternatives}
+            "n_candidates": n_candidates, "fragments": frags,
+            "ambiguous": ambiguous, "alternatives": alternatives}
 
 
 def definition_ids(graph, symbol: str) -> list[str]:
@@ -230,7 +274,9 @@ def impact_category(label: str, sf: str, ft: str) -> str:
 def resolved_hdr(name: str, verb: str, r: dict) -> str:
     amb = ""
     if r["n_candidates"] > 1:
-        amb = f" · {r['n_candidates']} кандидат(ов)" + (" ⚠ неоднозначно" if r["ambiguous"] else "")
+        amb = f" · {r['n_candidates']} опред." + (" ⚠ неоднозначно" if r["ambiguous"] else "")
+    elif r.get("fragments"):
+        amb = f" · +{r['fragments']} reference-узлов"
     hdr = f"[{name}] {verb}: {r['label']} ({r['ft']}, {r['sf']}:{r['loc']}){amb}"
     alts = r.get("alternatives") or []
     if r.get("ambiguous") and alts:

@@ -139,7 +139,9 @@ def grafit_explain(symbol: str, project: str = "", neighbors: int = 10, snippet:
     match = "точное совпадение" if r["match"] == "exact" else "по подстроке"
     hdr = f"[{name}] {r['label']} ({r['ft']}) — {match}"
     if r["n_candidates"] > 1:
-        hdr += f" · {r['n_candidates']} кандидат(ов)" + (" ⚠ неоднозначно" if r["ambiguous"] else "")
+        hdr += f" · {r['n_candidates']} опред." + (" ⚠ неоднозначно" if r["ambiguous"] else "")
+    elif r.get("fragments"):
+        hdr += f" · +{r['fragments']} reference-узлов"
     out = [fresh, f"{hdr}\n  {r['sf']}:{r['loc']}"]
     out.extend(_alt_lines(r))
     if snippet:
