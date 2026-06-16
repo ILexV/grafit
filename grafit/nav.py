@@ -406,6 +406,24 @@ def _file_node(graph, sf: str):
     return (rs[0][0], rs[0][1]) if rs else None
 
 
+def file_imports(graph, sf: str, exclude_id: str | None = None, limit: int = 6):
+    """Исходящие import-рёбра ФАЙЛА символа: (file_label, rel, target_label, target_sf).
+
+    imports/imports_from в графе висят на файл-узле, а не на функции/компоненте — поэтому
+    у function node в explain не видно, что импортирует его файл. Для code-символа
+    подтягиваем это явно. Пусто, если файл-узел не найден или это сам узел.
+    """
+    fn = _file_node(graph, sf)
+    if not fn or fn[0] == exclude_id:
+        return []
+    rs = graph.query(
+        "MATCH (f:Entity {id:$id})-[r:LINK]->(m:Entity) "
+        "WHERE r.relation IN ['imports', 'imports_from'] "
+        "RETURN DISTINCT r.relation, m.label, m.source_file LIMIT $lim",
+        params={"id": fn[0], "lim": limit}).result_set
+    return [(fn[1], rel, lbl, msf) for rel, lbl, msf in rs]
+
+
 def _endpoint_alts(graph, node: dict) -> list[tuple]:
     """routing-алиасы + узел-файл символа (для файл-уровневых рёбер вроде imports)."""
     alts = _route_alts(graph, node)

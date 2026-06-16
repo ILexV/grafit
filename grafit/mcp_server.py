@@ -149,7 +149,12 @@ def grafit_explain(symbol: str, project: str = "", neighbors: int = 10, snippet:
     nbs = search.neighbors(g, r["id"], neighbors)
     for d, rel, mlabel, msf in nbs:
         out.append(_nb(d, rel, mlabel, msf))
-    if nbs:
+    # file-level imports: для функции/компонента показать, что импортирует её файл
+    # (imports висят на файл-узле, не на символе) — помечаем как производные «via file».
+    fimp = nav.file_imports(g, r["sf"], exclude_id=r["id"]) if r["ft"] == "code" else []
+    for fname, rel, mlabel, msf in fimp:
+        out.append(f"  ⋯{rel}→ {mlabel} ({msf}) (via {fname})")
+    if nbs or fimp:
         out.append(_LEGEND)
     return "\n".join(out)
 
