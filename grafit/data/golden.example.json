@@ -1,0 +1,12 @@
+[
+  {"q": "вход пользователя по логину и паролю, выдача JWT", "expect": ["jwt", "auth/commands/login"]},
+  {"q": "аудит: запись истории изменений сущностей", "expect": ["audit"]},
+  {"q": "оптимистичная блокировка при конкурентном изменении", "expect": ["concurrency"]},
+  {"q": "права администратора организации", "expect": ["organizationadmin", "authorization"]},
+  {"q": "обновление access-токена refresh", "expect": ["refreshtoken"]},
+  {"q": "транзакционный запуск нескольких операций записи", "expect": ["transaction"]},
+  {"q": "хелперы прав доступа на фронтенде", "expect": ["permissions"]},
+  {"q": "защищённые маршруты и роутинг фронтенда", "expect": ["protectedroute", "router", "routing"]},
+  {"q": "интернационализация и локализация", "expect": ["i18n", "locale"]},
+  {"q": "JwtTokenService где реализован", "expect": ["jwttokenservice"]}
+]

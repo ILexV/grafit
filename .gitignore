@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# grafit локальное состояние (если GRAFIT_HOME указан внутрь репо)
+.grafit/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

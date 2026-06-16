@@ -1,0 +1,20 @@
+# Альтернатива `grafit up` — поднять FalkorDB через compose.
+# docker compose up -d
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: grafit-falkordb
+    ports:
+      - "127.0.0.1:6399:6379"   # данные/запросы (Redis-протокол), только локально
+      - "127.0.0.1:6400:3000"   # встроенный web-браузер графа
+    volumes:
+      - grafit-falkordb:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  grafit-falkordb:
