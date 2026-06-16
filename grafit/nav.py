@@ -399,9 +399,98 @@ def bridged_path(graph, a: dict, b: dict, max_hops: int = 6):
     return best
 
 
+def _logical_neighbors(graph, label: str, fanout: int = 300):
+    """Соседи ЛОГИЧЕСКОГО символа label: реальные рёбра ОТ ВСЕХ узлов с этой меткой
+    (обе стороны — схлопывает фрагменты graphify в один символ) + convention-рёбра.
+
+    Возвращает [(neighbor_label, rel, bridge_bool)]. Generic-хабы и semantic/soft-рёбра
+    отфильтрованы, иначе BFS уходит через 'string'/'Task' и conceptually_related_to.
+    Запрос по n.label (не по id) — именно это объединяет canonical-определение и
+    per-file reference-узлы одного имени.
+    """
+    rs = graph.query(
+        "MATCH (n:Entity) WHERE n.label = $L MATCH (n)-[r:LINK]-(m:Entity) "
+        "WHERE m.label <> $L RETURN DISTINCT r.relation, m.label LIMIT $lim",
+        params={"L": label, "lim": fanout}).result_set
+    out = [(mlabel, rel, False) for rel, mlabel in rs
+           if rel not in SOFT_RELS and not common.is_generic(mlabel)]
+    for c in convention_links(graph, label):
+        if c["rel"] in _ROUTING_RELS:
+            out.append((c["label"], _BRIDGE_LABEL[c["rel"]], True))
+    return out
+
+
+def compose_path(graph, a: dict, b: dict, max_hops: int = 6, label_cap: int = 2000):
+    """Tier-3 fallback: собрать путь a→b, трактуя одноимённые узлы как ОДИН логический
+    символ (схлопывание фрагментов). Двунаправленный BFS по нормализованным меткам через
+    реальные рёбра (обе стороны, по всем инстансам метки) + convention-рёбра.
+
+    Включается только когда прямой и одномостовой пути не нашлись: длинные backend-flows
+    (Controller→Command→Handler→Service) рвутся на стыке, где символ фрагментирован на
+    canonical-определение и per-file reference-узлы. Двунаправленный обход (встреча
+    посередине) держит латентность в узде на плотном графе. Слабее по направлению —
+    переходы помечаются composed (направление приблизительное). Возвращает (labels, rels)|None.
+    """
+    start_n, goal_n = _norm(a["label"]), _norm(b["label"])
+    if start_n == goal_n:
+        return None
+    # parent_f[x]=(prev,label,rel,bridge): ребро prev─rel→x; parent_b[x]: ребро x─rel→prev
+    # (prev ближе к цели). Оба в forward-ориентации (start→goal) для единой сборки.
+    parent_f = {start_n: (None, a["label"], None, False)}
+    parent_b = {goal_n: (None, b["label"], None, False)}
+    front_f = [(start_n, a["label"])]
+    front_b = [(goal_n, b["label"])]
+    visited = 0
+    for _ in range((int(max_hops) + 1) // 2):
+        for front, parent, other in ((front_f, parent_f, parent_b),
+                                     (front_b, parent_b, parent_f)):
+            nextf = []
+            for cur_n, cur_label in front:
+                visited += 1
+                if visited > label_cap:
+                    return None
+                for nlabel, rel, bridge in _logical_neighbors(graph, cur_label):
+                    nn = _norm(nlabel)
+                    if nn in parent:
+                        continue
+                    parent[nn] = (cur_n, nlabel, rel, bridge)
+                    if nn in other:
+                        return _compose_join(parent_f, parent_b, nn)
+                    nextf.append((nn, nlabel))
+            front[:] = nextf
+        if not front_f and not front_b:
+            break
+    return None
+
+
+def _compose_join(parent_f, parent_b, meet):
+    """Сшить forward-половину (start→meet) и backward-половину (meet→goal) в (labels, rels)."""
+    chain = []
+    cur = meet
+    while cur is not None:                       # meet → start
+        prev_n, label, rel, bridge = parent_f[cur]
+        chain.append((label, rel, bridge))
+        cur = prev_n
+    chain.reverse()                              # start → meet
+    labels = [c[0] for c in chain]
+    rels = [{"rel": c[1], "bridge": c[2], "composed": True} for c in chain[1:]]
+    cur = meet
+    while parent_b[cur][0] is not None:          # meet → goal
+        prev_n, _lbl, rel, bridge = parent_b[cur]
+        rels.append({"rel": rel, "bridge": bridge, "composed": True})
+        labels.append(parent_b[prev_n][1])
+        cur = prev_n
+    return labels, rels
+
+
+def find_route(graph, a: dict, b: dict, max_hops: int = 6):
+    """Лучший путь a→b: прямой → одномостовой → составной (canonical fallback)."""
+    return bridged_path(graph, a, b, max_hops) or compose_path(graph, a, b, max_hops)
+
+
 def render_path(name: str, path) -> str:
     """Однострочный путь с типом каждого перехода: ─rel→ структурное ребро,
-    ⋯rel→ производный переход (by-naming мост или in_file — символ→его файл)."""
+    ⋯rel→ производный переход (by-naming мост, in_file или составной canonical-хоп)."""
     labels, rels = path
     s = labels[0]
     for i, r in enumerate(rels):
@@ -409,6 +498,8 @@ def render_path(name: str, path) -> str:
         s += f"  {mark}{r['rel']}→  {labels[i + 1]}"
     derived = list(dict.fromkeys(r["rel"] for r in rels if r.get("bridge")))
     suffix = f"   (⋯ производные: {', '.join(derived)})" if derived else ""
+    if any(r.get("composed") for r in rels):
+        suffix += "   (составной путь — направление приблизительное)"
     return f"[{name}] {s}{suffix}"
 
 
@@ -435,7 +526,7 @@ def format_trace(graph, name: str, source: str, max_hops: int = 4,
         rt = resolve_node(graph, target)
         if not rt:
             return [f"[{name}] цель '{target}' не найдена"]
-        path = bridged_path(graph, rs, rt, max_hops=max_hops)
+        path = find_route(graph, rs, rt, max_hops=max_hops)
         if not path:
             out = [f"[{name}] путь {rs['label']} → {rt['label']} не найден (≤{max_hops})"]
             hint = related_hint(graph, rs["id"], rs["label"])

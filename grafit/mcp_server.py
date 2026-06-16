@@ -160,7 +160,7 @@ def grafit_find_path(source: str, target: str, project: str = "", max_hops: int 
     a, b = nav.resolve_node(g, source), nav.resolve_node(g, target)
     if not a or not b:
         return f"{fresh}\n[{name}] не найдено: {source if not a else target}"
-    path = nav.bridged_path(g, a, b, max_hops=int(max_hops))
+    path = nav.find_route(g, a, b, max_hops=int(max_hops))
     if not path:
         out = [fresh, f"[{name}] путь {source} → {target} не найден (≤{max_hops} шагов, по направлению рёбер)"]
         hint = nav.related_hint(g, a["id"], a["label"])
