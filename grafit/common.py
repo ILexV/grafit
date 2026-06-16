@@ -228,6 +228,21 @@ def read_snippet(root, source_file, loc, window=12, max_chars=500, cache=None) -
     return "\n".join(lines[b:e]).strip()[:max_chars]
 
 
+# Парсер CYPHER-заголовка FalkorDB отвергает строковые параметры с сырыми
+# управляющими байтами (NUL, прочие C0 кроме \t\n\r, DEL, C1) — запрос падает с
+# «Failed to parse query parameter». Такие байты попадают из исходников (например
+# регэксп `/[\x00-\x1f\x7f]/`, записанный буквальными control-символами). Семантики
+# они не несут, поэтому вычищаем их из любой строки до отправки в граф/эмбеддер.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def strip_control(s):
+    """Убрать управляющие символы (кроме \\t\\n\\r), ломающие парсер параметров FalkorDB."""
+    if not isinstance(s, str):
+        return s
+    return _CONTROL_RE.sub("", s)
+
+
 # --- кэш эмбеддингов (инкрементальная заливка) ---
 # Ключ = sha1(модель + '\0' + текст узла). Один вектор на уникальный текст;
 # перезаливка считает только новые/изменённые узлы.
@@ -319,4 +334,4 @@ def node_text(n: dict, comm_labels: dict, root=None, cache=None, snippets=True) 
         parts.append(cl)
     if n.get("file_type"):
         parts.append(n["file_type"])
-    return " | ".join(p for p in parts if p)
+    return strip_control(" | ".join(p for p in parts if p))

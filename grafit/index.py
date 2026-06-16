@@ -104,11 +104,15 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
         pass
     g_db = db.select_graph(name)
 
+    # strip_control на границе записи: FalkorDB-парсер параметров отвергает строки с
+    # сырыми управляющими байтами (см. common.strip_control). Чистим все строковые поля,
+    # чтобы краш не зависел от того, откуда пришёл текст (исходник, label, метка сообщества).
+    sc = common.strip_control
     rows = [{
-        "id": n["id"], "label": n.get("label", ""), "ft": n.get("file_type", ""),
-        "sf": n.get("source_file", ""), "loc": n.get("source_location") or "",
-        "comm": n.get("community"), "clabel": comm_labels.get(str(n.get("community")), ""),
-        "text": txt, "emb": e,
+        "id": sc(n["id"]), "label": sc(n.get("label", "")), "ft": sc(n.get("file_type", "")),
+        "sf": sc(n.get("source_file", "")), "loc": sc(n.get("source_location") or ""),
+        "comm": n.get("community"), "clabel": sc(comm_labels.get(str(n.get("community")), "")),
+        "text": sc(txt), "emb": e,
     } for n, e, txt in zip(nodes, embs, clean_texts)]
     for i in range(0, len(rows), 200):
         g_db.query(
@@ -131,7 +135,7 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
     except Exception as ex:
         print(f"fulltext index: {ex}")
 
-    erows = [{"s": l["source"], "t": l["target"], "rel": l.get("relation", "link"),
+    erows = [{"s": sc(l["source"]), "t": sc(l["target"]), "rel": sc(l.get("relation", "link")),
               "w": l.get("weight", 1.0)} for l in links]
     for i in range(0, len(erows), 500):
         g_db.query(
