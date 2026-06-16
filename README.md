@@ -101,6 +101,13 @@ CLS→mean pooling между версиями). Поэтому fastembed **за
 эквивалентны); при неоднозначности сообщает число кандидатов. Обход capнут (`node_cap`),
 усечение всегда помечается `(+N ещё)`.
 
+**Convention-деривация** (без LLM, без перезаливки): часть связей graphify не извлекает
+(DI, MediatR, тест-naming). grafit добавляет их по конвенциям имён на query-time, помечая
+`(by naming)` / inferred (стор не засоряется): `X ↔ XTests` (`tested_by`),
+`XCommand/XQuery ↔ XCommandHandler` (`handled_by`/`handles`), `IFoo ↔ Foo` (`impl_of`).
+Когда прямого пути/потока нет, `trace`/`find_path` дают **fallback**: связанные символы по
+конвенциям и ближайшим references/imports вместо «не найдено».
+
 ## Разделение данных между проектами
 Один FalkorDB, **один именованный граф на проект** (имя = basename git-репо, очищенное).
 Реестр `~/.grafit/projects.json` ловит коллизии имён. Модель эмбеддингов общая

@@ -150,6 +150,56 @@ def shortest_path(graph, a_id: str, b_id: str, max_hops: int = 6):
     return min(found, key=len) if found else None
 
 
+# --- convention-деривация (Tier 4): рёбра по конвенциям имён, которых нет в графе.
+#     Делается на query-time (стор не засоряем); помечается '(by naming)' / inferred.
+#     Узлы существуют, но graphify не связал их (DI/MediatR/тест-naming/интерфейс↔impl).
+
+def _bare(label: str) -> str:
+    """Имя без ведущих точек и хвостовых скобок, регистр сохранён ('.Foo()' -> 'Foo')."""
+    return (label or "").strip().lstrip(".").rstrip("()")
+
+
+def _conv_names(label: str) -> list[tuple[str, str]]:
+    """Кандидаты (relation, target_label) по конвенциям имён для символа label."""
+    base = _bare(label)
+    if not base:
+        return []
+    out = [("tested_by", base + "Tests"), ("tested_by", base + "Test")]
+    if base.endswith(("Command", "Query")):
+        out.append(("handled_by", base + "Handler"))      # LoginCommand -> LoginCommandHandler
+    if base.endswith("Handler"):
+        out.append(("handles", base[:-len("Handler")]))   # LoginCommandHandler -> LoginCommand
+    if len(base) > 1 and base[0] == "I" and base[1].isupper():
+        out.append(("impl_of", base[1:]))                  # IJwtTokenService -> JwtTokenService
+    else:
+        out.append(("impl_of", "I" + base))                # JwtTokenService -> IJwtTokenService
+    return out
+
+
+def convention_links(graph, label: str) -> list[dict]:
+    """Существующие узлы, связанные с label по конвенции имён (точное имя, без LLM/graphify)."""
+    cands = _conv_names(label)
+    if not cands:
+        return []
+    names = list({t for _, t in cands})
+    rs = graph.query(
+        "MATCH (n:Entity) WHERE n.label IN $names "
+        "RETURN n.id, n.label, n.file_type, n.source_file",
+        params={"names": names}).result_set
+    bylabel: dict = {}
+    for nid, lbl, ft, sf in rs:
+        bylabel.setdefault(lbl, []).append({"id": nid, "label": lbl, "file_type": ft, "source_file": sf})
+    out, seen = [], set()
+    self_bare = _bare(label)
+    for rel, tgt in cands:
+        for n in bylabel.get(tgt, []):
+            if _bare(n["label"]) == self_bare or n["id"] in seen:
+                continue
+            seen.add(n["id"])
+            out.append({"rel": rel, **n})
+    return out
+
+
 def impact_category(label: str, sf: str, ft: str) -> str:
     """Категория зависимого узла для impact: tests|frontend|docs|contract|backend|other."""
     if common.is_test_path(sf):
@@ -208,14 +258,18 @@ def format_tests(graph, name: str, symbol: str, max_hops: int = 2) -> list[str]:
                      DEPENDENCY_RELS | CONTAINMENT_RELS, max_hops=max_hops)
     tests = [x for x in rows if common.is_test_path(x["source_file"])]
     out = [resolved_hdr(name, "tests", r)]
-    if not tests:
-        out.append(f"прямых тестовых связей ≤{max_hops} hops нет")
-        return out
     byfile: dict = {}
     for t in sorted(tests, key=lambda x: x["hop"]):
         byfile.setdefault(t["source_file"], t)
     for sf, t in byfile.items():
         out.append(f"  ─ {t['rel']} ({t['hop']} hop)  {t['label']}  ({sf})")
+    # convention: класс XTests, даже если ребра в графе нет
+    conv = [c for c in convention_links(graph, r["label"])
+            if c["rel"] == "tested_by" and c["source_file"] not in byfile]
+    for c in conv:
+        out.append(f"  ⋯ tested_by (by naming)  {c['label']}  ({c['source_file']})")
+    if not tests and not conv:
+        out.append(f"прямых тестовых связей ≤{max_hops} hops нет")
     return out
 
 
@@ -229,22 +283,43 @@ def format_impact(graph, name: str, symbol: str, max_hops: int = 2) -> list[str]
     out = [resolved_hdr(name, "impact", r)]
     if defs:
         out.append("определён в:  " + " · ".join(f"{d['label']} ({d['rel']})" for d in defs[:5]))
-    if not deps:
+    if deps:
+        groups: dict = {}
+        for d in deps:
+            groups.setdefault(impact_category(d["label"], d["source_file"], d["file_type"]), []).append(d)
+        tail = "  (+обход усечён)" if trunc else ""
+        out.append(f"зависят (≤{max_hops} hops, {len(deps)}){tail}:")
+        for cat in ("tests", "frontend", "backend", "contract", "docs", "other"):
+            items = groups.get(cat)
+            if not items:
+                continue
+            shown = items[:10]
+            extra = f"  (+{len(items) - len(shown)} ещё)" if len(items) > len(shown) else ""
+            out.append(f"  {cat} ({len(items)}):  " + " · ".join(i["label"] for i in shown) + extra)
+    # convention: ломаются по конвенции (handler у Command, impl у интерфейса, XTests),
+    # даже если ребра в графе нет
+    seen_ids = {d["id"] for d in deps}
+    conv = [c for c in convention_links(graph, r["label"]) if c["id"] not in seen_ids]
+    if conv:
+        out.append("по конвенции (by naming):")
+        for c in conv:
+            out.append(f"  ⋯ {c['rel']}  {c['label']}  ({c['source_file']})")
+    if not deps and not conv:
         out.append(f"зависимостей ≤{max_hops} hops не найдено")
-        return out
-    groups: dict = {}
-    for d in deps:
-        groups.setdefault(impact_category(d["label"], d["source_file"], d["file_type"]), []).append(d)
-    tail = "  (+обход усечён)" if trunc else ""
-    out.append(f"зависят (≤{max_hops} hops, {len(deps)}){tail}:")
-    for cat in ("tests", "frontend", "backend", "contract", "docs", "other"):
-        items = groups.get(cat)
-        if not items:
-            continue
-        shown = items[:10]
-        extra = f"  (+{len(items) - len(shown)} ещё)" if len(items) > len(shown) else ""
-        out.append(f"  {cat} ({len(items)}):  " + " · ".join(i["label"] for i in shown) + extra)
     return out
+
+
+def related_hint(graph, node_id: str, label: str, limit: int = 8) -> list[str]:
+    """Fallback (#6): связанные символы, когда прямого пути/потока нет — конвенции +
+    ближайшие references/imports в обе стороны. Чтобы ответ не был просто «не найдено»."""
+    lines = []
+    for c in convention_links(graph, label)[:limit]:
+        lines.append(f"  ⋯ {c['rel']} (by naming)  {c['label']}  ({c['source_file']})")
+    rows, _ = expand(graph, [node_id], "both",
+                     {"references", "imports", "imports_from", "calls"}, max_hops=1, node_cap=limit)
+    for x in rows[:limit]:
+        lines.append(f"  ─ {x['rel']} → {x['label']}  ({x['source_file']})")
+    return lines
 
 
 def format_trace(graph, name: str, source: str, max_hops: int = 4,
@@ -258,15 +333,25 @@ def format_trace(graph, name: str, source: str, max_hops: int = 4,
             return [f"[{name}] цель '{target}' не найдена"]
         path = shortest_path(graph, rs["id"], rt["id"], max_hops=max_hops)
         if not path:
-            return [f"[{name}] путь {rs['label']} → {rt['label']} не найден (≤{max_hops})"]
+            out = [f"[{name}] путь {rs['label']} → {rt['label']} не найден (≤{max_hops})"]
+            hint = related_hint(graph, rs["id"], rs["label"])
+            if hint:
+                out.append("прямого пути нет; связано с источником:")
+                out.extend(hint)
+            return out
         return [f"[{name}] " + "  →  ".join(path)]
     rels = set(FLOW_RELS) | ({"references"} if with_references else set())
     rows, trunc = expand(graph, [rs["id"]], "out", rels, max_hops=max_hops)
     out = [f"[{name}] trace ↓ {rs['label']} ({'/'.join(sorted(rels))}, ≤{max_hops})"]
     if not rows:
-        hint = (f"  (у '{source}' {rs['n_candidates']} одноимённых узлов — уточни символ/класс)"
-                if rs["n_candidates"] > 1 else "  (исходящих flow-связей нет)")
-        out.append(hint)
+        if rs["n_candidates"] > 1:
+            out.append(f"  (у '{source}' {rs['n_candidates']} одноимённых узлов — уточни символ/класс)")
+        else:
+            out.append("  (исходящих flow-связей нет)")
+        hint = related_hint(graph, rs["id"], rs["label"])
+        if hint:
+            out.append("связано (не прямой flow):")
+            out.extend(hint)
         return out
     out.extend(render_tree(rs["id"], rs["label"], rows))
     if trunc:

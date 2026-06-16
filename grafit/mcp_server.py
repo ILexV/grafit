@@ -139,7 +139,12 @@ def grafit_find_path(source: str, target: str, project: str = "", max_hops: int 
         return f"{fresh}\n[{name}] не найдено: {source if not a else target}"
     path = nav.shortest_path(g, a["id"], b["id"], max_hops=int(max_hops))
     if not path:
-        return f"{fresh}\n[{name}] путь {source} → {target} не найден (≤{max_hops} шагов, по направлению рёбер)"
+        out = [fresh, f"[{name}] путь {source} → {target} не найден (≤{max_hops} шагов, по направлению рёбер)"]
+        hint = nav.related_hint(g, a["id"], a["label"])
+        if hint:
+            out.append(f"прямого пути нет; связано с {a['label']}:")
+            out.extend(hint)
+        return "\n".join(out)
     return f"{fresh}\n[{name}] " + "  →  ".join(path)
 
 
