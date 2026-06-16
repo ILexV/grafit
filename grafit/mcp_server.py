@@ -80,7 +80,9 @@ def grafit_explain(symbol: str, project: str = "", neighbors: int = 10) -> str:
     g, name = _graph(project or None)
     rs = g.query(
         "MATCH (n:Entity) WHERE toLower(n.label) = toLower($s) OR n.label CONTAINS $s "
-        "RETURN n.id, n.label, n.file_type, n.source_file, n.source_location LIMIT 1",
+        "RETURN n.id, n.label, n.file_type, n.source_file, n.source_location "
+        # точное совпадение имени важнее подстроки (класс ProcessVersionStateMachine, а не файл .cs)
+        "ORDER BY CASE WHEN toLower(n.label) = toLower($s) THEN 0 ELSE 1 END LIMIT 1",
         params={"s": symbol}).result_set
     if not rs:
         return f"[{name}] узел '{symbol}' не найден"
@@ -98,20 +100,28 @@ def grafit_find_path(source: str, target: str, project: str = "", max_hops: int 
 
     def resolve(s):
         rs = g.query("MATCH (n:Entity) WHERE toLower(n.label)=toLower($s) OR n.label CONTAINS $s "
-                     "RETURN n.id LIMIT 1", params={"s": s}).result_set
+                     "RETURN n.id "
+                     "ORDER BY CASE WHEN toLower(n.label)=toLower($s) THEN 0 ELSE 1 END LIMIT 1",
+                     params={"s": s}).result_set
         return rs[0][0] if rs else None
 
     a, b = resolve(source), resolve(target)
     if not a or not b:
         return f"[{name}] не найдено: {source if not a else target}"
-    rs = g.query(
-        f"MATCH (a:Entity {{id:$a}}), (b:Entity {{id:$b}}) "
-        f"MATCH p = shortestPath((a)-[:LINK*..{int(max_hops)}]-(b)) "
-        f"RETURN [n IN nodes(p) | n.label]",
-        params={"a": a, "b": b}).result_set
-    if not rs or not rs[0][0]:
-        return f"[{name}] путь {source} → {target} не найден (≤{max_hops} шагов)"
-    return f"[{name}] " + "  →  ".join(rs[0][0])
+    # FalkorDB: shortestPath только в WITH/RETURN и ТОЛЬКО направленный. Пробуем оба
+    # направления (a→b и a←b) и берём кратчайший — покрывает монотонные по направлению цепи.
+    h = int(max_hops)
+    found = []
+    for arrow in (f"-[:LINK*..{h}]->", f"<-[:LINK*..{h}]-"):
+        rs = g.query(
+            f"MATCH (a:Entity {{id:$a}}), (b:Entity {{id:$b}}) "
+            f"RETURN [n IN nodes(shortestPath((a){arrow}(b))) | n.label]",
+            params={"a": a, "b": b}).result_set
+        if rs and rs[0][0]:
+            found.append(rs[0][0])
+    if not found:
+        return f"[{name}] путь {source} → {target} не найден (≤{max_hops} шагов, по направлению рёбер)"
+    return f"[{name}] " + "  →  ".join(min(found, key=len))
 
 
 def main():
