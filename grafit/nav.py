@@ -382,8 +382,9 @@ def format_impact(graph, name: str, symbol: str, max_hops: int = 2) -> list[str]
 # interface↔impl (направление меняется на интерфейсе) и Command↔Handler (MediatR — реального
 # ребра mediator.Send(LoginCommand)→LoginCommandHandler в графе нет).
 _ROUTING_RELS = {"impl_of", "handles", "handled_by"}
-# как назвать мост в выводе для направления, в котором его проходим
-_BRIDGE_LABEL = {"impl_of": "impl_of", "handles": "handled_by", "handled_by": "handled_by"}
+# как назвать мост в выводе — по направлению прохода: Command→Handler = handled_by,
+# Handler→Command = handles (не схлопывать в одно, иначе теряется семантика направления)
+_BRIDGE_LABEL = {"impl_of": "impl_of", "handles": "handles", "handled_by": "handled_by"}
 
 
 def _route_alts(graph, node: dict) -> list[tuple]:
