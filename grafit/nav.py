@@ -405,6 +405,42 @@ def _endpoint_alts(graph, node: dict) -> list[tuple]:
     return alts
 
 
+def _instances(graph, label: str) -> list[str]:
+    """ID всех узлов того же логического символа (нормализованное имя), включая
+    file-scoped reference-фрагменты. _bare убирает скобки/точки для CONTAINS-поиска."""
+    ln = _norm(label)
+    return [c[0] for c in _candidates(graph, _bare(label)) if _norm(c[1]) == ln]
+
+
+def _instance_path(graph, a: dict, b: dict, max_hops: int = 6):
+    """Кратчайший РЕАЛЬНЫЙ направленный путь между любыми инстансами символов a и b.
+
+    Резолвер целит в каноническое определение, но реальное ребро (references/imports/…)
+    часто идёт к/от file-scoped фрагмента того же имени. Кросс-произведение инстансов
+    считается на сервере (shortestPath по спискам id). Рёбра реальные → bridge=False,
+    путь чистый directed (не составной). Возвращает (labels, rels) или None.
+    """
+    aids, bids = _instances(graph, a["label"]), _instances(graph, b["label"])
+    if not aids or not bids:
+        return None
+    h = int(max_hops)
+    best = None
+    for arrow in (f"-[:LINK*..{h}]->", f"<-[:LINK*..{h}]-"):
+        sp = f"shortestPath((a){arrow}(b))"
+        rs = graph.query(
+            f"MATCH (a:Entity), (b:Entity) WHERE a.id IN $aids AND b.id IN $bids AND a.id <> b.id "
+            f"WITH {sp} AS p WHERE p IS NOT NULL "
+            f"RETURN [n IN nodes(p) | n.label], [r IN relationships(p) | r.relation] "
+            f"ORDER BY length(p) LIMIT 1",
+            params={"aids": aids, "bids": bids}).result_set
+        if rs and rs[0][0]:
+            labels = rs[0][0]
+            rels = [{"rel": r, "bridge": False} for r in (rs[0][1] or [])]
+            if best is None or len(labels) < len(best[0]):
+                best = (labels, rels)
+    return best
+
+
 def bridged_path(graph, a: dict, b: dict, max_hops: int = 6):
     """Путь a→b; если прямого нет — мостит концы через convention-алиасы (impl_of/handled_by).
 
@@ -442,7 +478,11 @@ def bridged_path(graph, a: dict, b: dict, max_hops: int = 6):
                 rels = prels + [{"rel": brel, "bridge": True}]
             if best is None or len(labels) < len(best[0]):
                 best = (labels, rels)
-    return best
+    if best:
+        return best
+    # instance-aware: реальное направленное ребро к/от file-scoped инстансу того же символа
+    # (чище, чем compose: directed, без пометки «составной»). До compose, после конвенций.
+    return _instance_path(graph, a, b, max_hops)
 
 
 def _logical_neighbors(graph, label: str, fanout: int = 300):
