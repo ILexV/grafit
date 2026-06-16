@@ -309,6 +309,35 @@ def format_impact(graph, name: str, symbol: str, max_hops: int = 2) -> list[str]
     return out
 
 
+def bridged_path(graph, a: dict, b: dict, max_hops: int = 6):
+    """Путь a→b; если прямого нет — мостит через impl_of-алиасы концов (интерфейс↔impl).
+
+    Кейс: Handler --references--> IFoo, но Foo --implements--> IFoo (направление меняется на
+    интерфейсе → directed shortestPath не находит). Пробуем a→I(b)/impl(b) и достраиваем
+    последний/первый переход как impl_of. Возвращает (path_labels|None, bridge_kind|None).
+    """
+    direct = shortest_path(graph, a["id"], b["id"], max_hops)
+    if direct:
+        return direct, None
+    a_alts = [(a["id"], a["label"])] + [(c["id"], c["label"])
+              for c in convention_links(graph, a["label"]) if c["rel"] == "impl_of"]
+    b_alts = [(b["id"], b["label"])] + [(c["id"], c["label"])
+              for c in convention_links(graph, b["label"]) if c["rel"] == "impl_of"]
+    best = None
+    for aid, alab in a_alts:
+        for bid, blab in b_alts:
+            if aid == a["id"] and bid == b["id"]:
+                continue  # прямой уже пробовали
+            p = shortest_path(graph, aid, bid, max_hops)
+            if not p:
+                continue
+            full = ([a["label"]] if alab != a["label"] else []) + list(p) \
+                + ([b["label"]] if blab != b["label"] else [])
+            if best is None or len(full) < len(best):
+                best = full
+    return (best, "impl_of") if best else (None, None)
+
+
 def related_hint(graph, node_id: str, label: str, limit: int = 8) -> list[str]:
     """Fallback (#6): связанные символы, когда прямого пути/потока нет — конвенции +
     ближайшие references/imports в обе стороны. Чтобы ответ не был просто «не найдено»."""
@@ -331,7 +360,7 @@ def format_trace(graph, name: str, source: str, max_hops: int = 4,
         rt = resolve_node(graph, target)
         if not rt:
             return [f"[{name}] цель '{target}' не найдена"]
-        path = shortest_path(graph, rs["id"], rt["id"], max_hops=max_hops)
+        path, bridge = bridged_path(graph, rs, rt, max_hops=max_hops)
         if not path:
             out = [f"[{name}] путь {rs['label']} → {rt['label']} не найден (≤{max_hops})"]
             hint = related_hint(graph, rs["id"], rs["label"])
@@ -339,7 +368,8 @@ def format_trace(graph, name: str, source: str, max_hops: int = 4,
                 out.append("прямого пути нет; связано с источником:")
                 out.extend(hint)
             return out
-        return [f"[{name}] " + "  →  ".join(path)]
+        line = f"[{name}] " + "  →  ".join(path)
+        return [line + (f"   (мост: {bridge} by naming)" if bridge else "")]
     rels = set(FLOW_RELS) | ({"references"} if with_references else set())
     rows, trunc = expand(graph, [rs["id"]], "out", rels, max_hops=max_hops)
     out = [f"[{name}] trace ↓ {rs['label']} ({'/'.join(sorted(rels))}, ≤{max_hops})"]
