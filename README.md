@@ -44,6 +44,8 @@ grafit list                          # графы проектов в инста
   через git-хук) — [`docs/setup-for-claude-code.md`](docs/setup-for-claude-code.md).
 - **opencode** (подключить MCP **только для чтения**; граф ведёт Claude Code) —
   [`docs/setup-for-opencode-readonly.md`](docs/setup-for-opencode-readonly.md).
+- **Веб-интерфейс графа** (FalkorDB Browser на :6400, что вводить при входе) —
+  [`docs/falkordb-browser.md`](docs/falkordb-browser.md).
 
 ## Общий сервис эмбеддингов (`grafit-embed`)
 Чтобы модель не грузилась в RAM в каждый процесс (по копии на агента/MCP-клиента),
