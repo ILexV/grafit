@@ -46,6 +46,18 @@ def _nb(rel, mlabel, msf) -> str:
     return f"  ⋯ {rel} → {mlabel} ({msf}) (inferred)"
 
 
+def _root(name: str) -> str:
+    """Корень проекта на диске для графа (из meta.json; иначе cwd)."""
+    m = common.load_meta().get(name) or {}
+    return m.get("root") or str(common.project_root())
+
+
+def _quote(root, sf, loc, cache) -> list[str]:
+    """Подтверждённая цитата: реальные строки файла у source_location (свежесть — в шапке)."""
+    snip = common.read_snippet(root, sf, loc, window=3, max_chars=240, cache=cache)
+    return [f"    │ {ln}" for ln in snip.splitlines()] if snip else []
+
+
 try:
     from mcp.server.fastmcp import FastMCP
 except Exception as ex:  # pragma: no cover
@@ -56,13 +68,15 @@ mcp = FastMCP("grafit")
 
 @mcp.tool()
 def grafit_search(question: str, k: int = 8, project: str = "", neighbors: int = 4,
-                  hybrid: bool = False, rerank: bool = False, kind: str = "all") -> str:
+                  hybrid: bool = False, rerank: bool = False, kind: str = "all",
+                  snippet: bool = False) -> str:
     """Семантический поиск по кодовой базе проекта (граф знаний). Возвращает наиболее
     релевантные узлы с цитатами path:line и соседями по графу.
 
     question: вопрос на естественном языке (RU/EN).
     project:  имя графа проекта (по умолчанию определяется из текущей папки).
     kind:     фильтр узлов — all|code|tests|docs|prod (prod = код без тестов/миграций/генерёнки).
+    snippet:  подмешать реальные строки исходника у каждого узла (source-first, экономит чтение).
     hybrid/rerank: опц. лексика+RRF / кросс-энкодер (по бенчмаркам прироста не дают)."""
     qvec, _ = _embed(question)
     g, name = _graph(project or None)
@@ -70,10 +84,14 @@ def grafit_search(question: str, k: int = 8, project: str = "", neighbors: int =
     rows = search.search(g, qvec, question, k=k, hybrid=hybrid, reranker=reranker, kind=kind)
     if not rows:
         return f"{_fresh(name, project or None)}\n[{name}] ничего не найдено (залит ли проект? `grafit load`)"
+    root = _root(name) if snippet else None
+    fcache: dict = {}
     out = [_fresh(name, project or None), f"[{name}] {question}"]
     for nid, label, ft, sf, loc, clabel, text, score in rows:
         tag = " [test]" if common.is_test_path(sf) else ""
         out.append(f"\n● {label} ({ft}){tag}\n  {sf}:{loc}  | community: {clabel}")
+        if snippet:
+            out.extend(_quote(root, sf, loc, fcache))
         for rel, mlabel, msf in search.neighbors(g, nid, neighbors):
             out.append("  " + _nb(rel, mlabel, msf))
     return "\n".join(out)
@@ -90,8 +108,10 @@ def grafit_list_projects() -> str:
 
 
 @mcp.tool()
-def grafit_explain(symbol: str, project: str = "", neighbors: int = 10) -> str:
-    """Объяснить узел (класс/функция/концепт) по имени и его связи в графе."""
+def grafit_explain(symbol: str, project: str = "", neighbors: int = 10, snippet: bool = True) -> str:
+    """Объяснить узел (класс/функция/концепт) по имени и его связи в графе.
+
+    snippet: показать реальные строки исходника у узла (по умолчанию да)."""
     g, name = _graph(project or None)
     fresh = _fresh(name, project or None)
     r = nav.resolve_node(g, symbol)
@@ -102,6 +122,8 @@ def grafit_explain(symbol: str, project: str = "", neighbors: int = 10) -> str:
     if r["n_candidates"] > 1:
         hdr += f" · {r['n_candidates']} кандидат(ов)" + (" ⚠ неоднозначно" if r["ambiguous"] else "")
     out = [fresh, f"{hdr}\n  {r['sf']}:{r['loc']}"]
+    if snippet:
+        out.extend(_quote(_root(name), r["sf"], r["loc"], {}))
     for rel, mlabel, msf in search.neighbors(g, r["id"], neighbors):
         out.append(_nb(rel, mlabel, msf))
     return "\n".join(out)

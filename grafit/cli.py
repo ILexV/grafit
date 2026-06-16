@@ -151,11 +151,17 @@ def _query(args):
     mode = ("гибрид" if args.hybrid else "вектор") + (f"+реранк:{rname}" if reranker else "")
     mode += f", kind={args.kind}" if args.kind != "all" else ""
     print(f"{fresh}\n[{name}] {args.question}   ({mode})\n{'=' * 70}")
+    root = common.project_root() if args.snippet else None
+    fcache: dict = {}
     for nid, label, ft, sf, loc, clabel, text, score in rows:
         tag = " ·тест" if common.is_test_path(sf) else ""
         print(f"\n● {label}  ({ft}){tag}")
         if sf:
             print(f"   {sf}:{loc}   сообщество: {clabel}")
+        if args.snippet:
+            snip = common.read_snippet(root, sf, loc, window=3, max_chars=240, cache=fcache)
+            for ln in snip.splitlines():
+                print(f"     │ {ln}")
         for rel, mlabel, msf in search.neighbors(g, nid, args.neighbors):
             mark = "─" if common.relation_kind(rel) == "structural" else "⋯"
             inf = "" if common.relation_kind(rel) == "structural" else "  (inferred)"
@@ -228,6 +234,7 @@ def main():
     p.add_argument("-k", type=int, default=8); p.add_argument("--neighbors", type=int, default=6)
     p.add_argument("--kind", choices=["all", "code", "tests", "docs", "prod"], default="all",
                    help="фильтр узлов: code|tests|docs|prod (prod=код без тестов/миграций/генерёнки)")
+    p.add_argument("--snippet", action="store_true", help="показать реальные строки исходника у узлов")
     p.add_argument("--cand", type=int, default=60)
     p.add_argument("--test-penalty", type=float, default=0.5)
     p.add_argument("--hybrid", action="store_true", help="вектор+лексика (RRF), opt-in")
