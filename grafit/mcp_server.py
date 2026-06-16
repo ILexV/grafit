@@ -137,7 +137,7 @@ def grafit_find_path(source: str, target: str, project: str = "", max_hops: int 
     a, b = nav.resolve_node(g, source), nav.resolve_node(g, target)
     if not a or not b:
         return f"{fresh}\n[{name}] не найдено: {source if not a else target}"
-    path, bridge = nav.bridged_path(g, a, b, max_hops=int(max_hops))
+    path = nav.bridged_path(g, a, b, max_hops=int(max_hops))
     if not path:
         out = [fresh, f"[{name}] путь {source} → {target} не найден (≤{max_hops} шагов, по направлению рёбер)"]
         hint = nav.related_hint(g, a["id"], a["label"])
@@ -145,8 +145,7 @@ def grafit_find_path(source: str, target: str, project: str = "", max_hops: int 
             out.append(f"прямого пути нет; связано с {a['label']}:")
             out.extend(hint)
         return "\n".join(out)
-    line = f"{fresh}\n[{name}] " + "  →  ".join(path)
-    return line + (f"   (мост: {bridge} by naming)" if bridge else "")
+    return f"{fresh}\n{nav.render_path(name, path)}"
 
 
 @mcp.tool()

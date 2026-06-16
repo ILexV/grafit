@@ -133,21 +133,26 @@ def expand(graph, start_ids, direction: str = "out", rels=None,
 
 
 def shortest_path(graph, a_id: str, b_id: str, max_hops: int = 6):
-    """Кратчайший направленный путь a→b или a←b (список label) или None.
+    """Кратчайший направленный путь a→b или a←b. Возвращает (labels, rels) или None.
 
+    rels[i] = {"rel": <тип ребра>, "bridge": False} связывает labels[i]→labels[i+1].
     FalkorDB: shortestPath только в WITH/RETURN и только направленный — пробуем оба
     направления и берём короче.
     """
     h = int(max_hops)
-    found = []
+    best = None
     for arrow in (f"-[:LINK*..{h}]->", f"<-[:LINK*..{h}]-"):
+        sp = f"shortestPath((a){arrow}(b))"
         rs = graph.query(
             f"MATCH (a:Entity {{id:$a}}), (b:Entity {{id:$b}}) "
-            f"RETURN [n IN nodes(shortestPath((a){arrow}(b))) | n.label]",
+            f"RETURN [n IN nodes({sp}) | n.label], [r IN relationships({sp}) | r.relation]",
             params={"a": a_id, "b": b_id}).result_set
         if rs and rs[0][0]:
-            found.append(rs[0][0])
-    return min(found, key=len) if found else None
+            labels = rs[0][0]
+            rels = [{"rel": r, "bridge": False} for r in (rs[0][1] or [])]
+            if best is None or len(labels) < len(best[0]):
+                best = (labels, rels)
+    return best
 
 
 # --- convention-деривация (Tier 4): рёбра по конвенциям имён, которых нет в графе.
@@ -336,17 +341,17 @@ def bridged_path(graph, a: dict, b: dict, max_hops: int = 6):
     """
     direct = shortest_path(graph, a["id"], b["id"], max_hops)
     if direct:
-        return direct, None
+        return direct
     a_alts, b_alts = _route_alts(graph, a), _route_alts(graph, b)
     # чистый convention-хоп: алиас одного конца — это сам другой конец (Command↔Handler рядом)
     for aid, _l, arel in a_alts:
         if arel and aid == b["id"]:
-            return [a["label"], b["label"]], arel
+            return [a["label"], b["label"]], [{"rel": arel, "bridge": True}]
     for bid, _l, brel in b_alts:
         if brel and bid == a["id"]:
-            return [a["label"], b["label"]], brel
+            return [a["label"], b["label"]], [{"rel": brel, "bridge": True}]
     # односторонний мост: ровно один конец заменяем алиасом (иначе получается зигзаг)
-    best = None  # (full_labels, bridge_label)
+    best = None  # (labels, rels)
     for aid, _l, arel in a_alts:
         for bid, _l2, brel in b_alts:
             if (arel is None) == (brel is None):
@@ -354,10 +359,27 @@ def bridged_path(graph, a: dict, b: dict, max_hops: int = 6):
             p = shortest_path(graph, aid, bid, max_hops)
             if not p:
                 continue
-            full = ([a["label"]] if arel else []) + list(p) + ([b["label"]] if brel else [])
-            if best is None or len(full) < len(best[0]):
-                best = (full, arel or brel)
-    return best if best else (None, None)
+            plabels, prels = p
+            if arel:
+                labels = [a["label"]] + plabels
+                rels = [{"rel": arel, "bridge": True}] + prels
+            else:
+                labels = plabels + [b["label"]]
+                rels = prels + [{"rel": brel, "bridge": True}]
+            if best is None or len(labels) < len(best[0]):
+                best = (labels, rels)
+    return best
+
+
+def render_path(name: str, path) -> str:
+    """Однострочный путь с типом каждого перехода: ─rel→ структурный, ⋯rel→ by-naming мост."""
+    labels, rels = path
+    s = labels[0]
+    for i, r in enumerate(rels):
+        mark = "⋯" if r.get("bridge") else "─"
+        s += f"  {mark}{r['rel']}→  {labels[i + 1]}"
+    suffix = "   (⋯ = by naming)" if any(r.get("bridge") for r in rels) else ""
+    return f"[{name}] {s}{suffix}"
 
 
 def related_hint(graph, node_id: str, label: str, limit: int = 8) -> list[str]:
@@ -382,7 +404,7 @@ def format_trace(graph, name: str, source: str, max_hops: int = 4,
         rt = resolve_node(graph, target)
         if not rt:
             return [f"[{name}] цель '{target}' не найдена"]
-        path, bridge = bridged_path(graph, rs, rt, max_hops=max_hops)
+        path = bridged_path(graph, rs, rt, max_hops=max_hops)
         if not path:
             out = [f"[{name}] путь {rs['label']} → {rt['label']} не найден (≤{max_hops})"]
             hint = related_hint(graph, rs["id"], rs["label"])
@@ -390,8 +412,7 @@ def format_trace(graph, name: str, source: str, max_hops: int = 4,
                 out.append("прямого пути нет; связано с источником:")
                 out.extend(hint)
             return out
-        line = f"[{name}] " + "  →  ".join(path)
-        return [line + (f"   (мост: {bridge} by naming)" if bridge else "")]
+        return [render_path(name, path)]
     rels = set(FLOW_RELS) | ({"references"} if with_references else set())
     rows, trunc = expand(graph, [rs["id"]], "out", rels, max_hops=max_hops)
     out = [f"[{name}] trace ↓ {rs['label']} ({'/'.join(sorted(rels))}, ≤{max_hops})"]
