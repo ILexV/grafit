@@ -103,10 +103,21 @@ def search(graph, qvec, question, k=8, cand=60, test_penalty=0.5,
 
 
 def neighbors(graph, node_id, limit=6):
-    """Соседи узла по графу (для обогащения ответа: тест → реализация и т.п.)."""
-    rs = graph.query(
-        "MATCH (n:Entity {id:$id})-[r:LINK]-(m:Entity) "
-        "RETURN DISTINCT r.relation, m.label, m.source_file LIMIT $lim",
-        params={"id": node_id, "lim": limit},
-    ).result_set
-    return [(rel, lbl, sf) for rel, lbl, sf in rs]
+    """Соседи узла С НАПРАВЛЕНИЕМ: (direction 'out'|'in', rel, label, source_file).
+
+    out = node→m (исходящее), in = m→node (входящее) — чтобы не путать «A imports B»
+    с «B imports A». Слоты делятся между направлениями (исходящим приоритет).
+    """
+    def fetch(arrow):
+        rs = graph.query(
+            f"MATCH (n:Entity {{id:$id}}){arrow}(m:Entity) "
+            f"RETURN DISTINCT r.relation, m.label, m.source_file LIMIT $lim",
+            params={"id": node_id, "lim": limit}).result_set
+        return rs
+
+    out_rows = [("out", rel, lbl, sf) for rel, lbl, sf in fetch("-[r:LINK]->")]
+    in_rows = [("in", rel, lbl, sf) for rel, lbl, sf in fetch("<-[r:LINK]-")]
+    keep_out = limit if not in_rows else max(1, (limit + 1) // 2)
+    res = out_rows[:keep_out]
+    res += in_rows[: limit - len(res)]
+    return res

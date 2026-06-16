@@ -39,11 +39,26 @@ def _fresh(name: str, project: str | None) -> str:
     return common.freshness_line(name, live_root=live)
 
 
-def _nb(rel, mlabel, msf) -> str:
-    """Соседняя связь с меткой уверенности: structural (─ →) vs inferred (⋯ → … (inferred))."""
-    if common.relation_kind(rel) == "structural":
-        return f"  ─ {rel} → {mlabel} ({msf})"
-    return f"  ⋯ {rel} → {mlabel} ({msf}) (inferred)"
+_LEGEND = "  легенда: →исходящее · ←входящее · ─структурное (AST) · ⋯производное (by-naming)"
+
+
+def _alt_lines(r: dict) -> list[str]:
+    """Строки с альтернативными кандидатами, когда символ неоднозначен (#1 disambiguation)."""
+    alts = r.get("alternatives") or []
+    if not r.get("ambiguous") or not alts:
+        return []
+    items = "; ".join(f"{a['label']} ({a['ft']}, {a['sf']})" for a in alts)
+    return [f"  ещё кандидаты: {items}  — уточни project/точное имя/путь"]
+
+
+def _nb(direction, rel, mlabel, msf) -> str:
+    """Соседняя связь с направлением и уверенностью: out '─rel→', in '←rel─';
+    структурное (AST) ─/→ vs производное (by-naming/семантика) ⋯ + '(inferred)'."""
+    struct = common.relation_kind(rel) == "structural"
+    body = "─" if struct else "⋯"
+    edge = f"{body}{rel}→" if direction == "out" else f"←{rel}{body}"
+    tail = "" if struct else " (inferred)"
+    return f"  {edge} {mlabel} ({msf}){tail}"
 
 
 def _root(name: str) -> str:
@@ -87,13 +102,17 @@ def grafit_search(question: str, k: int = 8, project: str = "", neighbors: int =
     root = _root(name) if snippet else None
     fcache: dict = {}
     out = [_fresh(name, project or None), f"[{name}] {question}"]
+    any_nb = False
     for nid, label, ft, sf, loc, clabel, text, score in rows:
         tag = " [test]" if common.is_test_path(sf) else ""
         out.append(f"\n● {label} ({ft}){tag}\n  {sf}:{loc}  | community: {clabel}")
         if snippet:
             out.extend(_quote(root, sf, loc, fcache))
-        for rel, mlabel, msf in search.neighbors(g, nid, neighbors):
-            out.append("  " + _nb(rel, mlabel, msf))
+        for d, rel, mlabel, msf in search.neighbors(g, nid, neighbors):
+            any_nb = True
+            out.append("  " + _nb(d, rel, mlabel, msf))
+    if any_nb:
+        out.append(_LEGEND)
     return "\n".join(out)
 
 
@@ -122,10 +141,14 @@ def grafit_explain(symbol: str, project: str = "", neighbors: int = 10, snippet:
     if r["n_candidates"] > 1:
         hdr += f" · {r['n_candidates']} кандидат(ов)" + (" ⚠ неоднозначно" if r["ambiguous"] else "")
     out = [fresh, f"{hdr}\n  {r['sf']}:{r['loc']}"]
+    out.extend(_alt_lines(r))
     if snippet:
         out.extend(_quote(_root(name), r["sf"], r["loc"], {}))
-    for rel, mlabel, msf in search.neighbors(g, r["id"], neighbors):
-        out.append(_nb(rel, mlabel, msf))
+    nbs = search.neighbors(g, r["id"], neighbors)
+    for d, rel, mlabel, msf in nbs:
+        out.append(_nb(d, rel, mlabel, msf))
+    if nbs:
+        out.append(_LEGEND)
     return "\n".join(out)
 
 

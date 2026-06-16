@@ -153,6 +153,7 @@ def _query(args):
     print(f"{fresh}\n[{name}] {args.question}   ({mode})\n{'=' * 70}")
     root = common.project_root() if args.snippet else None
     fcache: dict = {}
+    nb_shown = False
     for nid, label, ft, sf, loc, clabel, text, score in rows:
         tag = " ·тест" if common.is_test_path(sf) else ""
         print(f"\n● {label}  ({ft}){tag}")
@@ -162,10 +163,15 @@ def _query(args):
             snip = common.read_snippet(root, sf, loc, window=3, max_chars=240, cache=fcache)
             for ln in snip.splitlines():
                 print(f"     │ {ln}")
-        for rel, mlabel, msf in search.neighbors(g, nid, args.neighbors):
-            mark = "─" if common.relation_kind(rel) == "structural" else "⋯"
-            inf = "" if common.relation_kind(rel) == "structural" else "  (inferred)"
-            print(f"     {mark} {rel} → {mlabel}  ({msf}){inf}")
+        for d, rel, mlabel, msf in search.neighbors(g, nid, args.neighbors):
+            struct = common.relation_kind(rel) == "structural"
+            body = "─" if struct else "⋯"
+            edge = f"{body}{rel}→" if d == "out" else f"←{rel}{body}"
+            inf = "" if struct else "  (inferred)"
+            print(f"     {edge} {mlabel}  ({msf}){inf}")
+            nb_shown = True
+    if nb_shown:
+        print("\nлегенда: →исходящее · ←входящее · ─структурное (AST) · ⋯производное (by-naming)")
 
 
 def _nav_cmd(args, fmt):

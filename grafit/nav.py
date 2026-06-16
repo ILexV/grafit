@@ -57,11 +57,13 @@ def resolve_node(graph, symbol: str, limit: int = 40) -> dict | None:
 
     nid, label, ft, sf, loc = sorted(rs, key=key)[0]
     exact = _norm(label) == sn
-    n_exact_nontest = sum(1 for c in rs
-                          if _norm(c[1]) == sn and not common.is_test_path(c[3]))
+    exact_nontest = [c for c in rs if _norm(c[1]) == sn and not common.is_test_path(c[3])]
+    alternatives = [{"label": c[1], "ft": c[2], "sf": c[3]}
+                    for c in exact_nontest if c[0] != nid and c[3]][:3]
     return {"id": nid, "label": label, "ft": ft, "sf": sf, "loc": loc,
             "match": "exact" if exact else "substring",
-            "n_candidates": len(rs), "ambiguous": n_exact_nontest > 1}
+            "n_candidates": len(rs), "ambiguous": len(exact_nontest) > 1,
+            "alternatives": alternatives}
 
 
 def definition_ids(graph, symbol: str) -> list[str]:
@@ -123,7 +125,8 @@ def expand(graph, start_ids, direction: str = "out", rels=None,
                 seen.add(nid)
                 nextf.append(nid)
                 out.append({"hop": hop, "parent": parent, "rel": rel, "id": nid,
-                            "label": label, "file_type": ft, "source_file": sf})
+                            "label": label, "file_type": ft, "source_file": sf,
+                            "direction": d})
             if truncated:
                 break
         if truncated:
@@ -228,7 +231,12 @@ def resolved_hdr(name: str, verb: str, r: dict) -> str:
     amb = ""
     if r["n_candidates"] > 1:
         amb = f" · {r['n_candidates']} кандидат(ов)" + (" ⚠ неоднозначно" if r["ambiguous"] else "")
-    return f"[{name}] {verb}: {r['label']} ({r['ft']}, {r['sf']}:{r['loc']}){amb}"
+    hdr = f"[{name}] {verb}: {r['label']} ({r['ft']}, {r['sf']}:{r['loc']}){amb}"
+    alts = r.get("alternatives") or []
+    if r.get("ambiguous") and alts:
+        items = "; ".join(f"{a['label']} ({a['ft']}, {a['sf']})" for a in alts)
+        hdr += f"\n  ещё кандидаты: {items}  — уточни project/точное имя/путь"
+    return hdr
 
 
 def _mark(rel: str):
@@ -409,11 +417,12 @@ def related_hint(graph, node_id: str, label: str, limit: int = 8) -> list[str]:
     ближайшие references/imports в обе стороны. Чтобы ответ не был просто «не найдено»."""
     lines = []
     for c in convention_links(graph, label)[:limit]:
-        lines.append(f"  ⋯ {c['rel']} (by naming)  {c['label']}  ({c['source_file']})")
+        lines.append(f"  ⋯{c['rel']}→ {c['label']}  ({c['source_file']})  (by naming)")
     rows, _ = expand(graph, [node_id], "both",
                      {"references", "imports", "imports_from", "calls"}, max_hops=1, node_cap=limit)
     for x in rows[:limit]:
-        lines.append(f"  ─ {x['rel']} → {x['label']}  ({x['source_file']})")
+        edge = f"─{x['rel']}→" if x["direction"] == "out" else f"←{x['rel']}─"
+        lines.append(f"  {edge} {x['label']}  ({x['source_file']})")
     return lines
 
 
