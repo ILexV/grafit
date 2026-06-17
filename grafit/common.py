@@ -14,7 +14,6 @@ HOME = Path(os.environ.get("GRAFIT_HOME", Path.home() / ".grafit"))
 CONFIG_PATH = HOME / "config.json"        # модель эмбеддингов (общая для всех проектов)
 REGISTRY_PATH = HOME / "projects.json"     # graph_name -> project abspath
 META_PATH = HOME / "meta.json"             # graph_name -> метаданные сборки (commit/время/счётчики)
-CACHE_DIR = HOME / "cache"                 # контент-адресуемый кэш эмбеддингов (по модели)
 
 # Приоритет локальных мультиязычных моделей.
 PREFERRED = [
@@ -114,6 +113,99 @@ def save_meta(name: str, **kw) -> dict:
     HOME.mkdir(parents=True, exist_ok=True)
     META_PATH.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
     return entry
+
+
+# --- сериализация заливок (post-commit-хуки разных проектов не должны бить параллельно) ---
+_LOAD_LOCK_FD = None
+
+
+def acquire_load_lock(wait: bool = True) -> bool:
+    """Глобальный межпроцессный замок на `grafit load` (один на машину за раз).
+
+    Хуки разных проектов и быстрые коммиты подряд иначе запускают N конкурентных
+    заливок, которые молотят общий эмбед-сервис (см. инцидент 2026-06-17). fd держится
+    до конца процесса — ОС снимает замок при exit, явный unlock не нужен (load одноразовый).
+    No-op на платформе без fcntl (Windows) — там вернёт True."""
+    global _LOAD_LOCK_FD
+    try:
+        import fcntl
+    except Exception:
+        return True
+    HOME.mkdir(parents=True, exist_ok=True)
+    _LOAD_LOCK_FD = open(HOME / "load.lock", "w")
+    try:
+        fcntl.flock(_LOAD_LOCK_FD, fcntl.LOCK_EX if wait else (fcntl.LOCK_EX | fcntl.LOCK_NB))
+        return True
+    except OSError:
+        return False
+
+
+def file_sha(p) -> str:
+    """sha1 содержимого файла (для coalesce: не перезаливать неизменённый graph.json)."""
+    h = hashlib.sha1()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+_PROJECT_LOCK_FD = None
+
+
+def acquire_project_load_lock(name: str, wait_kill: float = 10.0) -> None:
+    """Преемптивный per-project замок: новый `grafit load` ОСТАНАВЛИВАЕТ ещё идущую заливку
+    ТОГО ЖЕ графа — она грузит уже устаревшие данные, а её посчитанные вектора всё равно
+    осели в Redis-кэше (HSET атомарен), так что новый load их переиспользует. Разные проекты
+    не трогаем (для них — глобальная сериализация acquire_load_lock). No-op без fcntl."""
+    global _PROJECT_LOCK_FD
+    try:
+        import fcntl, signal, time
+    except Exception:
+        return
+    HOME.mkdir(parents=True, exist_ok=True)
+    fd = open(HOME / f"load.{sanitize(name)}.lock", "a+")
+    got = _try_flock(fd)
+    if not got:
+        # этот граф уже заливается — снять прошлый процесс (его данные устарели)
+        try:
+            fd.seek(0); raw = fd.read().strip()
+            old_pid = int(raw) if raw.isdigit() else 0
+        except Exception:
+            old_pid = 0
+        if old_pid and old_pid != os.getpid():
+            print(f"[grafit] прерываю прошлую заливку '{name}' (pid {old_pid}) — есть свежие изменения")
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.kill(old_pid, sig)
+                except ProcessLookupError:
+                    break
+                except Exception:
+                    break
+                waited = 0.0
+                while waited < wait_kill and not got:
+                    got = _try_flock(fd)
+                    if got:
+                        break
+                    time.sleep(0.2); waited += 0.2
+                if got:
+                    break
+        if not got:
+            import fcntl as _f
+            _f.flock(fd, _f.LOCK_EX)   # подстраховка — дождаться блокирующе
+    try:
+        fd.seek(0); fd.truncate(); fd.write(str(os.getpid())); fd.flush()
+    except Exception:
+        pass
+    _PROJECT_LOCK_FD = fd   # держим открытым до конца процесса (ОС снимет замок при exit)
+
+
+def _try_flock(fd) -> bool:
+    import fcntl
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
 
 
 def git_info(root) -> dict | None:
@@ -386,30 +478,56 @@ def text_hash(model: str, text: str) -> str:
     return hashlib.sha1(f"{model}\x00{text}".encode("utf-8")).hexdigest()
 
 
-def _cache_path(model: str) -> Path:
-    return CACHE_DIR / f"{sanitize(model)}.npz"
+# Бэкенд кэша — Redis-hash в том же FalkorDB (key `grafit:emb:<model>`, field=text_hash,
+# value=сырые float32-байты). Преимущества против прежнего общего `<model>.npz`:
+#   • запись по полю (HSET) атомарна — параллельные `grafit load` дописывают свои
+#     вектора, не затирая чужие (раньше целиковый np.savez давал last-writer-wins + рваный файл);
+#   • кросс-процессный (все агенты видят один кэш), переживает рестарт (volume FalkorDB /data).
+# ВАЖНО: falkordb.FalkorDB.connection создаётся с decode_responses=True и испортил бы
+# бинарь — поэтому держим ОТДЕЛЬНЫЙ redis-клиент с decode_responses=False к тому же порту.
+
+def _emb_key(model: str) -> str:
+    return f"grafit:emb:{sanitize(model)}"
 
 
-def load_emb_cache(model: str) -> dict:
-    """hash -> вектор (numpy). Пусто, если кэша нет."""
-    p = _cache_path(model)
-    if not p.exists():
+def emb_redis(host: str, port: int):
+    """Бинарный redis-клиент к тому же FalkorDB (None при недоступности — кэш просто off)."""
+    try:
+        import redis
+        c = redis.Redis(host=host, port=port, decode_responses=False)
+        c.ping()
+        return c
+    except Exception:
+        return None
+
+
+def emb_cache_get(conn, model: str, hashes: list) -> dict:
+    """hash -> np.float32-вектор для присутствующих ключей. {} при недоступности."""
+    if conn is None or not hashes:
         return {}
     import numpy as np
-    with np.load(p, allow_pickle=True) as d:
-        keys = d["keys"].tolist()   # каждый массив читаем РОВНО один раз
-        vecs = d["vecs"]            # (иначе NpzFile перечитывает файл на каждом [i] -> RAM-бомба)
-    return {k: vecs[i] for i, k in enumerate(keys)}
+    uniq = list(dict.fromkeys(hashes))   # без дублей в HMGET
+    try:
+        vals = conn.hmget(_emb_key(model), uniq)
+    except Exception:
+        return {}
+    out = {}
+    for h, v in zip(uniq, vals):
+        if v:
+            out[h] = np.frombuffer(v, dtype="float32")
+    return out
 
 
-def save_emb_cache(model: str, mapping: dict) -> None:
-    if not mapping:
+def emb_cache_put(conn, model: str, mapping: dict) -> None:
+    """Дописать новые вектора (HSET по полю — атомарно, без wipe)."""
+    if conn is None or not mapping:
         return
     import numpy as np
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    keys = np.array(list(mapping.keys()))
-    vecs = np.array([list(v) for v in mapping.values()], dtype="float32")
-    np.savez(_cache_path(model), keys=keys, vecs=vecs)
+    payload = {h: np.asarray(list(v), dtype="float32").tobytes() for h, v in mapping.items()}
+    try:
+        conn.hset(_emb_key(model), mapping=payload)
+    except Exception:
+        pass
 
 
 # Генерик/шумовые узлы из AST (типы, дженерик-параметры, xUnit-атрибуты, примитивы).
@@ -490,9 +608,13 @@ def kind_matches(sf: str | None, ft: str | None, kind: str) -> bool:
     return True
 
 
-def node_text(n: dict, comm_labels: dict, root=None, cache=None, snippets=True) -> str:
+def node_text(n: dict, comm_labels: dict, root=None, cache=None, snippets=True,
+              include_community=True) -> str:
     # Порядок: label → сниппет → путь → сообщество → тип. label+сниппет первыми,
     # чтобы при обрезке по лимиту токенов не терялось имя символа + сигнатура.
+    # include_community=False — для текста, по которому считается эмбеддинг/ключ кэша:
+    # метку сообщества graphify регенерирует при каждой пересборке (недетерминированная
+    # кластеризация), и её участие в ключе инвалидировало бы кэш целиком (см. index.py).
     parts = [n.get("label", "")]
     if snippets:
         snip = read_snippet(root, n.get("source_file"), n.get("source_location"), cache=cache)
@@ -501,9 +623,10 @@ def node_text(n: dict, comm_labels: dict, root=None, cache=None, snippets=True) 
     sf = n.get("source_file") or ""
     if sf:
         parts.append(sf.replace("/", " ").replace(".", " "))
-    cl = comm_labels.get(str(n.get("community")))
-    if cl:
-        parts.append(cl)
+    if include_community:
+        cl = comm_labels.get(str(n.get("community")))
+        if cl:
+            parts.append(cl)
     if n.get("file_type"):
         parts.append(n["file_type"])
     return strip_control(" | ".join(p for p in parts if p))

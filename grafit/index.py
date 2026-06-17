@@ -33,6 +33,21 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
     root = common.project_root(Path(project) if project else None)
     name = common.graph_name(graph, root)
     gj = ensure_graph_json(root, build)
+
+    # Преемпция: если ЭТОТ граф уже заливается (новый коммит обогнал прошлую заливку) —
+    # снимаем её и встаём на место, latest-данные сразу свежие (вектора прошлой заливки
+    # уже в Redis-кэше — не потеряны). Разные проекты не трогаем.
+    common.acquire_project_load_lock(name)
+    # Глобальный замок: сериализует заливки РАЗНЫХ проектов (post-commit-хуки бьют
+    # одновременно) — общий эмбед-сервис не любит N заливок сразу. Блокируемся до освобождения.
+    common.acquire_load_lock()
+    # Coalesce: если graph.json не изменился с прошлой успешной заливки этого графа —
+    # пропускаем (graphify детерминирован при PYTHONHASHSEED=0, одинаковый код → тот же файл).
+    gsha = common.file_sha(gj)
+    if not no_cache and not build and (common.load_meta().get(name) or {}).get("graph_sha") == gsha:
+        print(f"✓ граф '{name}': graph.json не изменился с прошлой заливки — пропуск.")
+        return {"graph": name, "skipped": True, "graph_sha": gsha}
+
     g = json.loads(gj.read_text(encoding="utf-8"))
     nodes = g["nodes"]
     links = g.get("links") or g.get("edges") or []
@@ -56,12 +71,21 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
         print(f"⚠ смена модели (было {cfg['model']}) — ОСТАЛЬНЫЕ проекты надо перезалить!")
 
     fcache: dict = {}
+    # clean_texts хранится как свойство узла `text` (full-text индекс/выдача) — с меткой
+    # сообщества, поведение поиска без изменений. Текст для ЭМБЕДДИНГА/кэша считаем отдельно
+    # БЕЗ метки сообщества: graphify регенерирует её при каждой пересборке (недетерминированная
+    # кластеризация), иначе ключ кэша «плавал» бы у всех узлов и кэш промахивался целиком.
     clean_texts = [common.node_text(n, comm_labels, root=root, cache=fcache,
                                     snippets=not no_snippets) for n in nodes]
-    embed_texts = ["passage: " + t for t in clean_texts] if is_e5 else clean_texts
+    embed_base = [common.node_text(n, comm_labels, root=root, cache=fcache,
+                                   snippets=not no_snippets, include_community=False) for n in nodes]
+    embed_texts = ["passage: " + t for t in embed_base] if is_e5 else embed_base
 
-    emb_cache = {} if (switching or no_cache) else common.load_emb_cache(model_name)
+    # кэш эмбеддингов в Redis/FalkorDB: чтение пропускаем при смене модели / --no-cache,
+    # запись новых векторов делаем всегда (атомарно по ключу — безопасно при параллельных load)
+    cache_conn = common.emb_redis(host, port)
     hashes = [common.text_hash(model_name, t) for t in embed_texts]
+    emb_cache = {} if (switching or no_cache) else common.emb_cache_get(cache_conn, model_name, hashes)
     missing = {}
     for h, t in zip(hashes, embed_texts):
         if h not in emb_cache and h not in missing:
@@ -77,15 +101,17 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
             emb = common.make_embedder(model_name, threads=threads)
         except Exception as ex:
             sys.exit(f"модель '{model_name}' недоступна: {ex}")
+        new = {}
         for h, v in zip(missing.keys(),
                         emb.embed(list(missing.values()), batch_size=batch, parallel=None)):
+            new[h] = v
             emb_cache[h] = v
+        common.emb_cache_put(cache_conn, model_name, new)
         # версия fastembed, которой реально посчитаны новые вектора (эталон для make_embedder)
         if isinstance(emb, common.RemoteEmbedder):
             fe_used = (common._probe_embed(common.embed_url() or "") or {}).get("fastembed")
         else:
             fe_used = common.fastembed_version()
-    common.save_emb_cache(model_name, emb_cache)
     if fe_used:
         common.update_config(fastembed=fe_used)
     embs = [list(emb_cache[h]) for h in hashes]
@@ -151,7 +177,7 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
     common.save_meta(name, commit=gi.get("commit"), short=gi.get("short"),
                      committed_at=gi.get("committed_at"), branch=gi.get("branch"),
                      dirty_at_build=gi.get("dirty"), built_at=common.now_iso(),
-                     root=str(root), nodes=cnt, edges=rel, model=model_name)
+                     root=str(root), nodes=cnt, edges=rel, model=model_name, graph_sha=gsha)
     if gi.get("dirty"):
         print("⚠ рабочее дерево грязное — граф отражает закоммиченное + несохранённые правки на диске")
 
