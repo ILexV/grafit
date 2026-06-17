@@ -102,12 +102,19 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
             emb = common.make_embedder(model_name, threads=threads)
         except Exception as ex:
             sys.exit(f"модель '{model_name}' недоступна: {ex}")
+        # Пишем кэш ИНКРЕМЕНТАЛЬНО батчами, а не одним вызовом в конце: если заливку
+        # убьёт преемпция/таймаут на середине (большой граф считается долго), посчитанные
+        # вектора уже в Redis — следующий load продолжит с места, а не с нуля. Без этого
+        # большой проект при частых коммитах не сходится (каждый прогон считает заново).
         new = {}
         for h, v in zip(missing.keys(),
                         emb.embed(list(missing.values()), batch_size=batch, parallel=None)):
             new[h] = v
             emb_cache[h] = v
-        common.emb_cache_put(cache_conn, model_name, new)
+            if len(new) >= 50:
+                common.emb_cache_put(cache_conn, model_name, new)
+                new = {}
+        common.emb_cache_put(cache_conn, model_name, new)   # остаток
         # версия fastembed, которой реально посчитаны новые вектора (эталон для make_embedder)
         if isinstance(emb, common.RemoteEmbedder):
             fe_used = (common._probe_embed(common.embed_url() or "") or {}).get("fastembed")
