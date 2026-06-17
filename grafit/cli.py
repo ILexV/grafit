@@ -102,7 +102,7 @@ def _load(args):
     from . import index
     index.index_project(project=args.path, graph=args.graph, host=args.host, port=args.port,
                         model=args.model, no_snippets=args.no_snippets, no_cache=args.no_cache,
-                        threads=args.threads, batch=args.batch, build=args.build)
+                        threads=args.threads, batch=args.batch, build=args.build, force=args.force)
 
 
 def _list(args):
@@ -225,6 +225,8 @@ def main():
     p.add_argument("--build", action="store_true", help="сначала построить graph.json через graphify")
     p.add_argument("--no-snippets", action="store_true")
     p.add_argument("--no-cache", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="перезалить даже если graph.json не изменился (обходит coalesce, кэш сохраняется)")
     p.add_argument("--threads", type=int, default=4); p.add_argument("--batch", type=int, default=16)
     p.set_defaults(fn=_load)
 
@@ -238,8 +240,10 @@ def main():
     p = sub.add_parser("query", help="семантический поиск по коду")
     p.add_argument("question")
     p.add_argument("-k", type=int, default=8); p.add_argument("--neighbors", type=int, default=6)
-    p.add_argument("--kind", choices=["all", "code", "tests", "docs", "prod"], default="all",
-                   help="фильтр узлов: code|tests|docs|prod (prod=код без тестов/миграций/генерёнки)")
+    p.add_argument("--kind", choices=["all", "code", "tests", "docs", "prod", "frontend", "backend"],
+                   default="all",
+                   help="фильтр узлов: code|tests|docs|prod|frontend|backend "
+                        "(prod=код без тестов/миграций/генерёнки; frontend/backend=код по слою)")
     p.add_argument("--snippet", action="store_true", help="показать реальные строки исходника у узлов")
     p.add_argument("--cand", type=int, default=60)
     p.add_argument("--test-penalty", type=float, default=0.5)

@@ -90,7 +90,9 @@ def grafit_search(question: str, k: int = 8, project: str = "", neighbors: int =
 
     question: вопрос на естественном языке (RU/EN).
     project:  имя графа проекта (по умолчанию определяется из текущей папки).
-    kind:     фильтр узлов — all|code|tests|docs|prod (prod = код без тестов/миграций/генерёнки).
+    kind:     фильтр узлов — all|code|tests|docs|prod|frontend|backend (prod = код без
+              тестов/миграций/генерёнки; frontend/backend = код одного слоя по пути — полезно,
+              когда общий UI-запрос поднимает backend-узлы выше нужного компонента).
     snippet:  подмешать реальные строки исходника у каждого узла (source-first, экономит чтение).
     hybrid/rerank: опц. лексика+RRF / кросс-энкодер (по бенчмаркам прироста не дают)."""
     qvec, _ = _embed(question)

@@ -266,7 +266,8 @@ def freshness_line(name: str, live_root=None) -> str:
     if st == "fresh":
         return f"граф @ {short} · свежий"
     if st == "dirty":
-        return f"⚠ граф @ {short} · рабочее дерево изменено (граф не видит несохранённого)"
+        return (f"⚠ граф @ {short} · рабочее дерево изменено, граф не видит несохранённого — "
+                f"закоммить (хук перельёт) или вручную `graphify . && grafit load`")
     if st == "behind":
         n = f.get("behind")
         dirty = (f.get("live") or {}).get("dirty")
@@ -587,8 +588,35 @@ def relation_kind(rel: str | None) -> str:
 _NONPROD_PARTS = ("migrations", "obj", "bin", "node_modules", "dist", "__generated__")
 
 
+# Слой узла по расширению (сильнее каталога — язык однозначнее имени папки),
+# с фолбэком на сегмент пути для неоднозначных случаев.
+_FRONT_EXT = {"tsx", "jsx", "ts", "js", "mjs", "cjs", "vue", "svelte",
+              "css", "scss", "sass", "less", "html"}
+_BACK_EXT = {"cs", "py", "go", "java", "kt", "rb", "php", "rs", "scala",
+             "ex", "exs", "c", "cc", "cpp", "h", "hpp", "swift"}
+_FRONT_DIRS = {"frontend", "client", "web", "webapp", "ui"}
+_BACK_DIRS = {"backend", "server", "api"}
+
+
+def layer_of(sf: str | None) -> str | None:
+    """frontend | backend | None — слой узла по пути исходника (для kind-фильтра)."""
+    s = (sf or "").lower()
+    base = s.rsplit("/", 1)[-1]
+    ext = base.rsplit(".", 1)[-1] if "." in base else ""
+    if ext in _BACK_EXT:
+        return "backend"
+    if ext in _FRONT_EXT:
+        return "frontend"
+    segs = s.split("/")
+    if any(p in _BACK_DIRS for p in segs):
+        return "backend"
+    if any(p in _FRONT_DIRS for p in segs):
+        return "frontend"
+    return None
+
+
 def kind_matches(sf: str | None, ft: str | None, kind: str) -> bool:
-    """Подходит ли узел под режим фильтра: all|code|tests|docs|prod."""
+    """Подходит ли узел под режим фильтра: all|code|tests|docs|prod|frontend|backend."""
     if kind == "all":
         return True
     is_test = is_test_path(sf)
@@ -598,6 +626,9 @@ def kind_matches(sf: str | None, ft: str | None, kind: str) -> bool:
         return (ft or "") in ("document", "concept", "rationale")
     if kind == "code":
         return (ft or "") == "code" and not is_test
+    if kind in ("frontend", "backend"):
+        # слой = только код (не тесты/доки), по стороне исходника
+        return (ft or "") == "code" and not is_test and layer_of(sf) == kind
     if kind == "prod":
         if (ft or "") != "code" or is_test:
             return False
@@ -606,6 +637,104 @@ def kind_matches(sf: str | None, ft: str | None, kind: str) -> bool:
             return False
         return not any(p in s.split("/") for p in _NONPROD_PARTS)
     return True
+
+
+# --- UI-текст из frontend-исходников (надписи экранов для семантического поиска) ---
+# JSX-текст между тегами, значения UI-атрибутов и многословные строковые литералы кладём
+# в текст узла → «найди экран по надписи» работает (узлом графа сам текст не является).
+# Тугие фильтры отсекают classNames, пути, идентификаторы. Только frontend-код.
+_JSX_TEXT_RE = re.compile(r">\s*([^<>{}\n][^<>{}\n]*?)\s*<")
+_UI_ATTR_RE = re.compile(
+    r"""\b(?:placeholder|title|label|aria-label|alt|tooltip|heading|header|caption|"""
+    r"""subtitle|description)\s*=\s*["']([^"'\n{}]{2,60})["']""", re.I)
+_QUOTED_RE = re.compile(r"""["']([^"'\n]{3,60})["']""")
+_CYR = re.compile(r"[А-Яа-яЁё]")
+
+
+def _looks_code(s: str) -> bool:
+    return bool(re.search(r"[=;(){}\[\]<>]|=>|&&|\|\||\$\{", s))
+
+
+# tailwind/className-токен: начинается с буквы/цифры/!, дальше только css-символы (вкл. точку
+# и слэш — `px-2.5`, `first:pt-0`, `!p-0`, `w-1/2`). Строка из ОДНИХ таких токенов = не UI-текст.
+_CSS_TOKEN = re.compile(r"[!a-z0-9][a-z0-9:.\-/!]*")
+
+
+def _is_ui_copy(s: str) -> bool:
+    """Строковый литерал похож на человеческую UI-надпись (не className/путь/ключ/идентификатор)?"""
+    s = s.strip()
+    if not (3 <= len(s) <= 60) or not re.search(r"[^\W\d_]", s):
+        return False
+    if s[0] in "./@#$%&" or any(ch in s for ch in ("/", "\\", "_")):
+        return False
+    if _looks_code(s):
+        return False
+    toks = s.split()
+    if toks and all(_CSS_TOKEN.fullmatch(t) for t in toks):           # className
+        return False
+    if " " not in s and (re.search(r"[.:]", s) or re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", s)):
+        return False  # i18n-ключ (menu:changePassword, pagination.pageOf) / одиночный идентификатор
+    return True
+
+
+def _jsx_ok(s: str) -> bool:
+    s = s.strip()
+    if not (2 <= len(s) <= 60) or not re.search(r"[^\W\d_]", s):
+        return False
+    if _looks_code(s) or s.split(" ", 1)[0] in ("import", "export", "const", "return", "function"):
+        return False
+    if " " not in s and (re.search(r"[.:_/]", s)
+                         or (not _CYR.search(s) and re.search(r"[a-z][A-Z]|[A-Z]{3,}", s))):
+        return False  # ключ/путь или camelCase/UPPER идентификатор без пробела — вероятно код
+    return True
+
+
+def extract_ui_text(root, sf, loc, cache=None, max_chars=240) -> str:
+    """Значимые надписи из тела frontend-узла (JSX-текст + UI-атрибуты + многословные литералы)."""
+    if layer_of(sf) != "frontend" or is_test_path(sf) or not loc:
+        return ""
+    nums = re.findall(r"\d+", str(loc))
+    if not nums:
+        return ""
+    p = (Path(root) / sf) if root else Path(sf)
+    key = str(p)
+    if cache is None:
+        cache = {}
+    if key not in cache:
+        try:
+            cache[key] = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            cache[key] = None
+    lines = cache[key]
+    if not lines:
+        return ""
+    start = int(nums[0])
+    end = int(nums[1]) if len(nums) > 1 else start + 80
+    body = "\n".join(lines[max(0, start - 1):min(len(lines), end)])
+    out, seen, total = [], set(), 0
+
+    def add(s):
+        nonlocal total
+        s = s.strip()
+        k = s.lower()
+        if s and k not in seen:
+            seen.add(k); out.append(s); total += len(s)
+
+    for m in _JSX_TEXT_RE.finditer(body):
+        if total >= max_chars:
+            break
+        if _jsx_ok(m.group(1)):
+            add(m.group(1))
+    for m in _UI_ATTR_RE.finditer(body):
+        if total >= max_chars:
+            break
+        add(m.group(1))
+    for m in _QUOTED_RE.finditer(body):
+        if total >= max_chars:
+            break
+        if _is_ui_copy(m.group(1)):
+            add(m.group(1))
+    return " | ".join(out)
 
 
 def node_text(n: dict, comm_labels: dict, root=None, cache=None, snippets=True,
@@ -620,6 +749,9 @@ def node_text(n: dict, comm_labels: dict, root=None, cache=None, snippets=True,
         snip = read_snippet(root, n.get("source_file"), n.get("source_location"), cache=cache)
         if snip:
             parts.append(snip)
+        ui = extract_ui_text(root, n.get("source_file"), n.get("source_location"), cache=cache)
+        if ui:
+            parts.append(ui)
     sf = n.get("source_file") or ""
     if sf:
         parts.append(sf.replace("/", " ").replace(".", " "))

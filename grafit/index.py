@@ -29,7 +29,7 @@ def ensure_graph_json(project: Path, build: bool) -> Path:
 
 
 def index_project(project=None, graph=None, host="localhost", port=6399, model=None,
-                  no_snippets=False, no_cache=False, threads=4, batch=16, build=False):
+                  no_snippets=False, no_cache=False, threads=4, batch=16, build=False, force=False):
     root = common.project_root(Path(project) if project else None)
     name = common.graph_name(graph, root)
     gj = ensure_graph_json(root, build)
@@ -44,8 +44,9 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
     # Coalesce: если graph.json не изменился с прошлой успешной заливки этого графа —
     # пропускаем (graphify детерминирован при PYTHONHASHSEED=0, одинаковый код → тот же файл).
     gsha = common.file_sha(gj)
-    if not no_cache and not build and (common.load_meta().get(name) or {}).get("graph_sha") == gsha:
-        print(f"✓ граф '{name}': graph.json не изменился с прошлой заливки — пропуск.")
+    if not no_cache and not build and not force \
+            and (common.load_meta().get(name) or {}).get("graph_sha") == gsha:
+        print(f"✓ граф '{name}': graph.json не изменился с прошлой заливки — пропуск (--force чтобы перезалить).")
         return {"graph": name, "skipped": True, "graph_sha": gsha}
 
     g = json.loads(gj.read_text(encoding="utf-8"))
