@@ -34,20 +34,19 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
     name = common.graph_name(graph, root)
     gj = ensure_graph_json(root, build)
 
-    # Преемпция: если ЭТОТ граф уже заливается (новый коммит обогнал прошлую заливку) —
-    # снимаем её и встаём на место, latest-данные сразу свежие (вектора прошлой заливки
-    # уже в Redis-кэше — не потеряны). Разные проекты не трогаем.
-    common.acquire_project_load_lock(name)
-    # Глобальный замок: сериализует заливки РАЗНЫХ проектов (post-commit-хуки бьют
-    # одновременно) — общий эмбед-сервис не любит N заливок сразу. Блокируемся до освобождения.
-    common.acquire_load_lock()
-    # Coalesce: если graph.json не изменился с прошлой успешной заливки этого графа —
-    # пропускаем (graphify детерминирован при PYTHONHASHSEED=0, одинаковый код → тот же файл).
+    # Coalesce ДО глобального замка: если graph.json не изменился с прошлой успешной заливки —
+    # пропускаем мгновенно, не вставая в очередь за чужой заливкой (graphify детерминирован при
+    # PYTHONHASHSEED=0, одинаковый код → тот же файл). Per-project coalescing rerun-цикла держит
+    # вызывающий `_load` (become_active_loader), здесь конкуренции этого графа уже нет.
     gsha = common.file_sha(gj)
     if not no_cache and not build and not force \
             and (common.load_meta().get(name) or {}).get("graph_sha") == gsha:
         print(f"✓ граф '{name}': graph.json не изменился с прошлой заливки — пропуск (--force чтобы перезалить).")
         return {"graph": name, "skipped": True, "graph_sha": gsha}
+
+    # Глобальный замок: сериализует заливки РАЗНЫХ проектов (post-commit-хуки бьют одновременно),
+    # общий эмбед-сервис не любит N заливок сразу. `_load` отпускает его между проходами rerun.
+    common.acquire_load_lock()
 
     g = json.loads(gj.read_text(encoding="utf-8"))
     nodes = g["nodes"]

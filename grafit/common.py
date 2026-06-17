@@ -151,6 +151,23 @@ def acquire_load_lock(wait: bool = True, timeout: float = 900.0) -> bool:
             time.sleep(0.5); waited += 0.5
 
 
+def release_load_lock() -> None:
+    """Снять глобальный замок (между проходами rerun-цикла — дать ход другим проектам)."""
+    global _LOAD_LOCK_FD
+    if _LOAD_LOCK_FD is None:
+        return
+    try:
+        import fcntl
+        fcntl.flock(_LOAD_LOCK_FD, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        _LOAD_LOCK_FD.close()
+    except Exception:
+        pass
+    _LOAD_LOCK_FD = None
+
+
 def file_sha(p) -> str:
     """sha1 содержимого файла (для coalesce: не перезаливать неизменённый graph.json)."""
     h = hashlib.sha1()
@@ -160,54 +177,62 @@ def file_sha(p) -> str:
     return h.hexdigest()
 
 
+# Coalescing «ровно один отложенный проход на проект»: пока для проекта идёт активная
+# заливка (per-project flock держит её процесс), любой новый триггер НЕ запускает второй
+# параллельный load и НЕ убивает активный — он лишь ставит файл-пометку `.rerun`. Активный
+# загрузчик в конце видит пометку и делает ОДИН догоняющий проход на свежем graph.json.
+# Так пачка из N коммитов в проект (в т.ч. разнесённых во времени, пока заливка идёт)
+# схлопывается в максимум один дополнительный проход, без гонок и без потери работы.
 _PROJECT_LOCK_FD = None
 
 
-def acquire_project_load_lock(name: str, wait_kill: float = 10.0) -> None:
-    """Преемптивный per-project замок: новый `grafit load` ОСТАНАВЛИВАЕТ ещё идущую заливку
-    ТОГО ЖЕ графа — она грузит уже устаревшие данные, а её посчитанные вектора всё равно
-    осели в Redis-кэше (HSET атомарен), так что новый load их переиспользует. Разные проекты
-    не трогаем (для них — глобальная сериализация acquire_load_lock). No-op без fcntl."""
+def become_active_loader(name: str) -> bool:
+    """Стать ЕДИНСТВЕННЫМ активным загрузчиком проекта name (non-blocking per-project flock).
+
+    True  — мы активны (fd держится до конца процесса, ОС снимет замок при exit).
+    False — заливка этого графа уже идёт в другом процессе; вызвавший должен пометить
+            request_rerun(name) и выйти (НЕ убивая активную). No-op без fcntl → True."""
     global _PROJECT_LOCK_FD
     try:
-        import fcntl, signal, time
+        import fcntl  # noqa: F401
     except Exception:
-        return
+        return True
     HOME.mkdir(parents=True, exist_ok=True)
     fd = open(HOME / f"load.{sanitize(name)}.lock", "a+")
-    got = _try_flock(fd)
-    if not got:
-        # этот граф уже заливается — снять прошлый процесс (его данные устарели)
-        try:
-            fd.seek(0); raw = fd.read().strip()
-            old_pid = int(raw) if raw.isdigit() else 0
-        except Exception:
-            old_pid = 0
-        if old_pid and old_pid != os.getpid():
-            print(f"[grafit] прерываю прошлую заливку '{name}' (pid {old_pid}) — есть свежие изменения")
-            for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.kill(old_pid, sig)
-                except ProcessLookupError:
-                    break
-                except Exception:
-                    break
-                waited = 0.0
-                while waited < wait_kill and not got:
-                    got = _try_flock(fd)
-                    if got:
-                        break
-                    time.sleep(0.2); waited += 0.2
-                if got:
-                    break
-        if not got:
-            import fcntl as _f
-            _f.flock(fd, _f.LOCK_EX)   # подстраховка — дождаться блокирующе
+    if not _try_flock(fd):
+        fd.close()
+        return False
+    _PROJECT_LOCK_FD = fd
+    return True
+
+
+def _rerun_path(name: str) -> Path:
+    return HOME / f"load.{sanitize(name)}.rerun"
+
+
+def request_rerun(name: str) -> None:
+    """Пометить: проекту нужен ещё один проход (изменения пришли, пока шла заливка)."""
     try:
-        fd.seek(0); fd.truncate(); fd.write(str(os.getpid())); fd.flush()
+        HOME.mkdir(parents=True, exist_ok=True)
+        _rerun_path(name).touch()
     except Exception:
         pass
-    _PROJECT_LOCK_FD = fd   # держим открытым до конца процесса (ОС снимет замок при exit)
+
+
+def take_rerun(name: str) -> bool:
+    """Снять пометку rerun и вернуть, была ли она (consume)."""
+    p = _rerun_path(name)
+    try:
+        if p.exists():
+            p.unlink()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def rerun_pending(name: str) -> bool:
+    return _rerun_path(name).exists()
 
 
 def _try_flock(fd) -> bool:

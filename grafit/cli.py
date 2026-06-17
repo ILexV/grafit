@@ -100,9 +100,24 @@ def _down(args):
 
 def _load(args):
     from . import index
-    index.index_project(project=args.path, graph=args.graph, host=args.host, port=args.port,
-                        model=args.model, no_snippets=args.no_snippets, no_cache=args.no_cache,
-                        threads=args.threads, batch=args.batch, build=args.build, force=args.force)
+    name = common.graph_name(args.graph or None,
+                             common.project_root(Path(args.path) if args.path else None))
+    # «Ровно один отложенный проход на проект»: если заливка этого графа уже идёт — не плодим
+    # второй процесс и не убиваем активный, лишь помечаем rerun и выходим. Активный загрузчик
+    # ниже после своего прохода увидит пометку и сделает ОДИН догоняющий проход на свежем графе.
+    if not common.become_active_loader(name):
+        common.request_rerun(name)
+        print(f"[grafit] заливка '{name}' уже идёт — отложен один повторный проход (rerun)")
+        return
+    while True:
+        common.take_rerun(name)          # снимаем pending: грузим текущее состояние графа
+        index.index_project(project=args.path, graph=args.graph, host=args.host, port=args.port,
+                            model=args.model, no_snippets=args.no_snippets, no_cache=args.no_cache,
+                            threads=args.threads, batch=args.batch, build=args.build, force=args.force)
+        common.release_load_lock()       # отпускаем глобальный замок — даём ход другим проектам
+        if not common.rerun_pending(name):
+            break
+        print(f"[grafit] во время заливки '{name}' пришли изменения — ещё один проход")
 
 
 def _list(args):
