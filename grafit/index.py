@@ -124,12 +124,15 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
         sys.exit(f"размерность {dim} != config {cfg.get('dim')}; перезапусти с --model.")
 
     db = common.connect(host, port)
-    g_db = db.select_graph(name)
+    # Строим в ОТДЕЛЬНЫЙ временный граф и подменяем живой атомарно (RENAME, ниже): читатели
+    # MCP всё время видят ЦЕЛЫЙ граф — старый до подмены, новый сразу после, без окна пустоты.
+    # Живой граф не удаляется, поэтому преемпция безопасна: убитая заливка портит лишь temp.
+    tmp = name + "__building"
     try:
-        g_db.delete()
+        db.select_graph(tmp).delete()   # подчистить остаток прошлой прерванной заливки
     except Exception:
         pass
-    g_db = db.select_graph(name)
+    g_db = db.select_graph(tmp)
 
     # strip_control на границе записи: FalkorDB-парсер параметров отвергает строки с
     # сырыми управляющими байтами (см. common.strip_control). Чистим все строковые поля,
@@ -172,6 +175,10 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
 
     cnt = g_db.query("MATCH (n:Entity) RETURN count(n)").result_set[0][0]
     rel = g_db.query("MATCH ()-[r:LINK]->() RETURN count(r)").result_set[0][0]
+
+    # Атомарная подмена: RENAME перезаписывает живой граф собранным temp одним шагом
+    # (Redis-операция). До этой строки запросы шли к старому графу, после — к новому.
+    db.connection.execute_command("RENAME", tmp, name)
 
     # метка свежести: на каком git-коммите построен граф (для grafit status / шапки ответов)
     gi = common.git_info(root) or {}

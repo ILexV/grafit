@@ -119,25 +119,36 @@ def save_meta(name: str, **kw) -> dict:
 _LOAD_LOCK_FD = None
 
 
-def acquire_load_lock(wait: bool = True) -> bool:
+def acquire_load_lock(wait: bool = True, timeout: float = 900.0) -> bool:
     """Глобальный межпроцессный замок на `grafit load` (один на машину за раз).
 
     Хуки разных проектов и быстрые коммиты подряд иначе запускают N конкурентных
     заливок, которые молотят общий эмбед-сервис (см. инцидент 2026-06-17). fd держится
     до конца процесса — ОС снимает замок при exit, явный unlock не нужен (load одноразовый).
+
+    Ожидание ОГРАНИЧЕНО timeout: зависший load не должен блокировать заливки всех проектов
+    навсегда. По истечении — продолжаем без сериализации (это лишь бережёт эмбед-сервис;
+    корректность держит сборка во временный граф + атомарный swap, конкуренции не боится).
     No-op на платформе без fcntl (Windows) — там вернёт True."""
     global _LOAD_LOCK_FD
     try:
-        import fcntl
+        import fcntl, time
     except Exception:
         return True
     HOME.mkdir(parents=True, exist_ok=True)
     _LOAD_LOCK_FD = open(HOME / "load.lock", "w")
-    try:
-        fcntl.flock(_LOAD_LOCK_FD, fcntl.LOCK_EX if wait else (fcntl.LOCK_EX | fcntl.LOCK_NB))
-        return True
-    except OSError:
-        return False
+    waited = 0.0
+    while True:
+        try:
+            fcntl.flock(_LOAD_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if not wait:
+                return False
+            if waited >= timeout:
+                print(f"[grafit] глобальный замок занят >{int(timeout)}s — продолжаю без сериализации")
+                return False
+            time.sleep(0.5); waited += 0.5
 
 
 def file_sha(p) -> str:
