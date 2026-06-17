@@ -492,6 +492,65 @@ def read_snippet(root, source_file, loc, window=12, max_chars=500, cache=None) -
     return "\n".join(lines[b:e]).strip()[:max_chars]
 
 
+def _file_lines(root, source_file, cache=None):
+    """Строки файла с кэшем по пути (тот же ключ str(p), что у read_snippet — общий cache)."""
+    p = (Path(root) / source_file) if root else Path(source_file)
+    key = str(p)
+    if cache is None:
+        cache = {}
+    if key not in cache:
+        try:
+            cache[key] = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            cache[key] = None
+    return cache[key]
+
+
+_DOC_LINE = re.compile(r"^\s*(///|//|/\*\*?|\*/|\*|#)")
+_DOC_STRIP = re.compile(r"^\s*(///?|/\*\*?|\*/?|#)+|\*/\s*$")
+
+
+def read_leading_comments(root, source_file, loc, cache=None, max_scan=15, max_chars=300) -> str:
+    """Блок doc-комментария НЕПОСРЕДСТВЕННО над объявлением (source_location).
+
+    read_snippet читает тело ВНИЗ от объявления, поэтому doc-комментарии над сигнатурой
+    (C# ///, JS/TS /**, ведущие //) в эмбеддинг не попадают. Здесь собираем их, пропуская
+    атрибуты/декораторы ([..] / @..) и пустые строки между комментарием и объявлением,
+    чистим маркеры комментов и XML-теги (<summary> и т.п.) — остаётся осмысленный текст."""
+    if not source_file or not loc:
+        return ""
+    nums = re.findall(r"\d+", str(loc))
+    if not nums:
+        return ""
+    lines = _file_lines(root, source_file, cache)
+    if not lines:
+        return ""
+    i = int(nums[0]) - 2        # строка НАД объявлением (0-индекс: сама декларация = start-1)
+    out, scanned = [], 0
+    while i >= 0 and scanned < max_scan:
+        s = lines[i].strip()
+        scanned += 1
+        if not s:                                            # пустая — продолжаем вверх
+            i -= 1; continue
+        if s.startswith(("[", "@")) or s in ("]", ")", "{"):  # атрибут/декоратор — пропускаем
+            i -= 1; continue
+        if _DOC_LINE.match(s) or s.endswith("*/"):           # строка-комментарий — собираем
+            out.append(s); i -= 1; continue
+        break                                                # реальный код — стоп
+    if not out:
+        return ""
+    out.reverse()
+    cleaned = []
+    for s in out:
+        s = _DOC_STRIP.sub("", s)
+        s = re.sub(r"</?[a-zA-Z][^>]*>", " ", s)             # XML doc-теги <summary>/<param>…
+        s = re.sub(r"\s+", " ", s).strip()
+        s = re.sub(r"^[\-=*_~\s]+|[\-=*_~\s]+$", "", s)      # разделители «--- ... ---»
+        if len(s) >= 3:
+            cleaned.append(s)
+    return " ".join(cleaned)[:max_chars]
+
+
 # Парсер CYPHER-заголовка FalkorDB отвергает строковые параметры с сырыми
 # управляющими байтами (NUL, прочие C0 кроме \t\n\r, DEL, C1) — запрос падает с
 # «Failed to parse query parameter». Такие байты попадают из исходников (например
@@ -785,6 +844,9 @@ def node_text(n: dict, comm_labels: dict, root=None, cache=None, snippets=True,
         snip = read_snippet(root, n.get("source_file"), n.get("source_location"), cache=cache)
         if snip:
             parts.append(snip)
+        doc = read_leading_comments(root, n.get("source_file"), n.get("source_location"), cache=cache)
+        if doc:
+            parts.append(doc)
         ui = extract_ui_text(root, n.get("source_file"), n.get("source_location"), cache=cache)
         if ui:
             parts.append(ui)
