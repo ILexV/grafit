@@ -9,7 +9,7 @@ grafit_status, grafit_tests, grafit_impact, grafit_trace.
 """
 from __future__ import annotations
 import os
-from . import common, nav, search
+from . import common, dupes, nav, search
 
 HOST = os.environ.get("GRAFIT_HOST", "localhost")
 PORT = int(os.environ.get("GRAFIT_PORT", "6399"))
@@ -98,6 +98,10 @@ grafit — граф знаний кодовой базы с СЕМАНТИЧЕС
 (какие тесты заденет): это машинный обход графа, он ловит НЕПРЯМЫХ потребителей, которых grep
 по имени пропускает. grafit_trace — поток вперёд (endpoint→handler→service), grafit_find_path —
 связь между двумя сущностями, grafit_explain — узел и его связи.
+
+Для рефакторинга дублей: grafit_similar(symbol) — что в проекте дублирует ВОТ ЭТУ функцию/
+компонент (код→код по вектору, перед написанием новой или выносом общего кода); grafit_dupes —
+глобальный скан копипаста по проекту (кластеры near-duplicate символов).
 
 Свежесть: каждый ответ начинается шапкой свежести. Если видишь «⚠ … перезалей `grafit load`» —
 граф отстал от кода: делай поправку на это и предложи перезалить.
@@ -238,6 +242,50 @@ def grafit_impact(symbol: str, project: str = "", max_hops: int = 2) -> str:
     g, name = _graph(project or None)
     return "\n".join([_fresh(name, project or None)]
                      + nav.format_impact(g, name, symbol, int(max_hops)))
+
+
+@mcp.tool()
+def grafit_similar(symbol: str, project: str = "", k: int = 6, threshold: float = 0.10,
+                   kind: str = "all", rerank: bool = False, snippet: bool = True) -> str:
+    """Near-duplicate символы для ОДНОГО символа — кандидаты на рефакторинг (общий хелпер/
+    extract-method). Сравнивает эмбеддинг узла (имя+тело+doc) с остальными по косинусу. В отличие
+    от grafit_search (запрос→код) это код→код: «что в проекте дублирует ВОТ ЭТУ функцию/компонент».
+    Отсекает шум: сам узел, generic/framework-методы (.Handle()/.Dispose()), символы из ТОГО ЖЕ
+    файла (co-location ≠ дубль) и графово-связанные (Command→Handler). Зови перед тем, как писать
+    новую функцию (нет ли уже такой) или вынося общий код.
+
+    threshold: максимальная косинусная дистанция (0=идентично; меньше — строже; дефолт 0.10).
+    kind:      фильтр узлов all|code|tests|docs|prod|frontend|backend.
+    rerank:    добить кросс-энкодером (отодвигает структурно-похожие, но разные по смыслу)."""
+    g, name = _graph(project or None)
+    reranker = search.get_reranker(threads=THREADS)[0] if rerank else None
+    root = _root(name) if snippet else None
+    return "\n".join([_fresh(name, project or None)]
+                     + dupes.format_similar(g, name, symbol, k=k, threshold=threshold,
+                                            kind=kind, reranker=reranker, root=root))
+
+
+@mcp.tool()
+def grafit_dupes(project: str = "", kind: str = "prod", threshold: float = 0.06,
+                 limit: int = 20, include_framework: bool = False, rerank: bool = False,
+                 snippet: bool = False) -> str:
+    """Глобальный скан дубликатов кода по всему проекту — кластеры near-duplicate символов
+    для рефакторинга. Для каждого узла берёт ближайших по вектору, копит МЕЖФАЙЛОВЫЕ
+    не-связанные пары (dist≤threshold) и кластеризует транзитивно (A~B, B~C ⇒ {A,B,C}).
+    Дороже grafit_similar (скан всего графа) — зови для аудита/«где у нас копипаст».
+
+    kind:               по умолчанию prod (код без тестов/миграций/генерёнки).
+    threshold:          максимальная косинусная дистанция пары (дефолт 0.06; ниже — строже).
+    include_framework:  включить шаблонные методы (.Handle()/…) — обычно шум, по умолч. выкл.
+    rerank:             кросс-энкодером отсеять структурно-похожие, но разные по смыслу пары.
+    snippet:            показать строки исходника у каждого члена кластера."""
+    g, name = _graph(project or None)
+    reranker = search.get_reranker(threads=THREADS)[0] if rerank else None
+    root = _root(name) if snippet else None
+    return "\n".join([_fresh(name, project or None)]
+                     + dupes.format_duplicates(g, name, kind=kind, threshold=threshold,
+                                               limit=limit, include_framework=include_framework,
+                                               reranker=reranker, root=root))
 
 
 @mcp.tool()

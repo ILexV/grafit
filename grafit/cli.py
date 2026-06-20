@@ -1,4 +1,4 @@
-"""grafit CLI: up | down | load | query | eval | list | mcp."""
+"""grafit CLI: up | down | load | query | similar | dupes | eval | list | mcp."""
 from __future__ import annotations
 import argparse, shutil, subprocess, sys
 from pathlib import Path
@@ -210,6 +210,30 @@ def _trace(args):
         g, name, args.source, args.hops, args.to or "", args.with_references))
 
 
+def _similar(args):
+    from . import dupes, search
+    name = common.graph_name(args.graph)
+    g = common.connect(args.host, args.port).select_graph(name)
+    fresh = common.freshness_line(name, live_root=(None if args.graph else common.project_root()))
+    reranker = search.get_reranker(threads=args.threads)[0] if args.rerank else None
+    root = common.project_root() if args.snippet else None
+    print("\n".join([fresh] + dupes.format_similar(
+        g, name, args.symbol, k=args.k, threshold=args.threshold, kind=args.kind,
+        reranker=reranker, root=root)))
+
+
+def _dupes(args):
+    from . import dupes, search
+    name = common.graph_name(args.graph)
+    g = common.connect(args.host, args.port).select_graph(name)
+    fresh = common.freshness_line(name, live_root=(None if args.graph else common.project_root()))
+    reranker = search.get_reranker(threads=args.threads)[0] if args.rerank else None
+    root = common.project_root() if args.snippet else None
+    print("\n".join([fresh] + dupes.format_duplicates(
+        g, name, kind=args.kind, threshold=args.threshold, topk=args.topk, limit=args.limit,
+        include_framework=args.include_framework, reranker=reranker, root=root)))
+
+
 def _eval(args):
     from . import eval as ev
     ev.run_eval(graph=args.graph, golden=args.golden, host=args.host,
@@ -284,6 +308,31 @@ def main():
     p.add_argument("--graph", default=None); p.add_argument("--hops", type=int, default=4)
     p.add_argument("--with-references", action="store_true", help="подмешать шумные references-рёбра")
     p.set_defaults(fn=_trace)
+
+    p = sub.add_parser("similar", help="near-duplicate символы для символа (кандидаты на рефакторинг)")
+    p.add_argument("symbol"); p.add_argument("--graph", default=None)
+    p.add_argument("-k", type=int, default=6)
+    p.add_argument("--threshold", type=float, default=0.10, help="макс. косинусная дистанция (0=идентично)")
+    p.add_argument("--kind", choices=["all", "code", "tests", "docs", "prod", "frontend", "backend"],
+                   default="all")
+    p.add_argument("--snippet", action="store_true", help="строки исходника у кандидатов")
+    p.add_argument("--rerank", action="store_true", help="кросс-энкодер вторым проходом")
+    p.add_argument("--threads", type=int, default=4)
+    p.set_defaults(fn=_similar)
+
+    p = sub.add_parser("dupes", help="глобальный скан дубликатов по проекту (кластеры)")
+    p.add_argument("--graph", default=None)
+    p.add_argument("--kind", choices=["all", "code", "tests", "docs", "prod", "frontend", "backend"],
+                   default="prod")
+    p.add_argument("--threshold", type=float, default=0.06, help="макс. косинусная дистанция пары")
+    p.add_argument("--topk", type=int, default=4, help="соседей на узел при скане")
+    p.add_argument("--limit", type=int, default=20, help="сколько кластеров показать")
+    p.add_argument("--include-framework", action="store_true",
+                   help="включить шаблонные методы (.Handle()/…) — обычно шум")
+    p.add_argument("--snippet", action="store_true", help="строки исходника у членов кластера")
+    p.add_argument("--rerank", action="store_true", help="кросс-энкодер вторым проходом")
+    p.add_argument("--threads", type=int, default=4)
+    p.set_defaults(fn=_dupes)
 
     p = sub.add_parser("eval", help="метрики поиска по золотому набору")
     p.add_argument("--graph", default=None); p.add_argument("--golden", default=None)

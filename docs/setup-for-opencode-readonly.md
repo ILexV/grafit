@@ -62,6 +62,8 @@ MCP-сервер `grafit mcp` — локальный stdio-процесс. openc
 | `grafit_search(question, k, project, neighbors)` | Семантический поиск по коду: релевантные узлы + цитаты `path:line` + соседи по графу |
 | `grafit_explain(symbol, project)` | Объяснить узел (класс/функция/концепт) и его связи |
 | `grafit_find_path(source, target, project)` | Кратчайший путь между двумя сущностями |
+| `grafit_similar(symbol, threshold, kind)` | Near-duplicate символы для символа (код→код): кандидаты на рефакторинг |
+| `grafit_dupes(kind, threshold, limit)` | Глобальный скан копипаста: кластеры near-duplicate символов |
 | `grafit_list_projects()` | Какие проекты залиты в общий FalkorDB |
 
 Проект определяется по **текущей папке** opencode (basename git-репо) или явным параметром

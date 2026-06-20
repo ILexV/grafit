@@ -80,8 +80,8 @@ CLS→mean pooling между версиями). Поэтому fastembed **за
 { "mcpServers": { "grafit": { "command": "grafit", "args": ["mcp"] } } }
 ```
 Инструменты: `grafit_search`, `grafit_list_projects`, `grafit_explain`, `grafit_find_path`,
-`grafit_status`, `grafit_tests`, `grafit_impact`, `grafit_trace`. Проект определяется по
-текущей папке клиента (или параметром `project`).
+`grafit_status`, `grafit_tests`, `grafit_impact`, `grafit_trace`, `grafit_similar`,
+`grafit_dupes`. Проект определяется по текущей папке клиента (или параметром `project`).
 
 Каждый ответ начинается со **строки свежести** графа (на каком коммите построен, отстал ли
 от HEAD, грязно ли дерево). У `grafit_search` есть `kind` — фильтр узлов `all|code|tests|docs|prod`
@@ -96,6 +96,19 @@ CLS→mean pooling между версиями). Поэтому fastembed **за
   сгруппированы по `tests/frontend/backend/contract/docs`.
 - **`grafit_trace(source, target="", with_references=False)`** — поток вперёд (endpoint →
   handler → service → …) деревом; с `target` — кратчайший путь `source→target`.
+
+### Поиск дубликатов кода (для рефакторинга)
+Сравнение узлов по вектору (код→код, в отличие от `grafit_search` запрос→код): близкие вектора =
+похожий по смыслу код — кандидаты на общий хелпер / extract-method. score — косинусная
+ДИСТАНЦИЯ (0 = идентично). Шум отсекается: self, generic/framework-методы (`.Handle()`),
+символы из ТОГО ЖЕ файла (co-location), графово-связанные и именные семьи (`XCommand` ↔
+`XCommandHandler`/`XCommandValidator`), file-узлы и записи из `.csproj`/конфигов.
+- **`grafit_similar(symbol)`** — что в проекте дублирует ВОТ ЭТОТ символ (зови перед тем, как
+  писать новую функцию или выносить общий код). `threshold` — макс. дистанция (дефолт 0.10).
+- **`grafit_dupes()`** — глобальный скан копипаста по проекту: межфайловые не-связанные пары
+  кластеризуются транзитивно (`A~B, B~C ⇒ {A,B,C}`). `kind=prod` по умолчанию, `threshold` 0.06.
+- Оба: `rerank=True` добивает кросс-энкодером (отодвигает структурно-похожие, но разные по
+  смыслу пары). CLI: `grafit similar <symbol>` и `grafit dupes`.
 
 Резолв имени предпочитает определение (точное имя → не-тест → код; `Foo`, `Foo()` и `.Foo()`
 эквивалентны); при неоднозначности сообщает число кандидатов. Обход capнут (`node_cap`),

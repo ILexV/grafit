@@ -4,7 +4,7 @@
 конвенции, классификацию reference-фрагментов, рендер пути (структурный/мост/составной),
 сшивку двунаправленного BFS, а также классификаторы common.
 """
-from grafit import nav, common
+from grafit import nav, common, dupes
 
 
 # --- nav._norm / _bare ---
@@ -132,3 +132,75 @@ def test_kind_matches():
     assert common.kind_matches("d.md", "document", "docs") is True
     assert common.kind_matches("backend/Data/Migrations/x.cs", "code", "prod") is False
     assert common.kind_matches("src/app.ts", "code", "prod") is True
+
+
+# --- dupes.is_noise_label (framework-шаблонные/generic имена) ---
+
+def test_noise_label_framework_methods():
+    # навязаны контрактом фреймворка → структурно одинаковы не из-за копипаста
+    assert dupes.is_noise_label(".Handle()") is True
+    assert dupes.is_noise_label("HandleAsync") is True
+    assert dupes.is_noise_label(".Dispose()") is True
+
+
+def test_noise_label_includes_generic():
+    assert dupes.is_noise_label("string") is True   # делегирует common.is_generic
+    assert dupes.is_noise_label(None) is True
+
+
+def test_noise_label_keeps_domain_symbols():
+    # доменно-значимые — НЕ шум, их дубли реальны (кандидаты на рефакторинг)
+    assert dupes.is_noise_label(".BuildExportDto()") is False
+    assert dupes.is_noise_label("HandleRequirementAsync") is False
+    assert dupes.is_noise_label("VersionStatusBadge") is False
+
+
+# --- dupes.is_family_pair (именная семья CQRS/MediatR) ---
+
+def test_family_pair_command_handler_validator():
+    assert dupes.is_family_pair("LoginCommand", "LoginCommandHandler") is True
+    assert dupes.is_family_pair("LoginCommand", "LoginCommandValidator") is True
+    assert dupes.is_family_pair("LoginCommandHandler", "LoginCommand") is True   # симметрично
+
+
+def test_family_pair_identical_names_are_real_clones():
+    # одинаковое имя в разных файлах — это искомый дубль, НЕ семья
+    assert dupes.is_family_pair(".BuildExportDto()", ".BuildExportDto()") is False
+
+
+def test_family_pair_prefix_difference_not_family():
+    # разные стемы (отличие по префиксу) — возможен реальный дубль, не семья
+    assert dupes.is_family_pair("UserDto", "OrgUserDto") is False
+
+
+# --- dupes.is_symbol_node (символ vs файл-узел/конфиг) ---
+
+def test_is_symbol_node_keeps_real_symbols():
+    assert dupes.is_symbol_node(".BuildExportDto()", "x/Handler.cs") is True
+    assert dupes.is_symbol_node("VersionStatusBadge", "x/Panel.tsx") is True
+
+
+def test_is_symbol_node_drops_file_and_config_nodes():
+    assert dupes.is_symbol_node("ProcessModelExportDto.cs", "x/Dto.cs") is False   # файл-узел
+    assert dupes.is_symbol_node("Microsoft.EntityFrameworkCore", "Bpm.Api.csproj") is False
+    assert dupes.is_symbol_node(None, "x.cs") is False
+
+
+# --- dupes.pair_key (ненаправленный ключ пары) ---
+
+def test_pair_key_is_order_independent():
+    assert dupes.pair_key("a", "b") == dupes.pair_key("b", "a") == ("a", "b")
+
+
+# --- dupes.cluster_pairs (union-find кластеризация) ---
+
+def test_cluster_pairs_transitive_merge():
+    # A~B, B~C ⇒ один кластер {A,B,C}; D~E — отдельный
+    clusters = dupes.cluster_pairs([("A", "B", 0.01), ("B", "C", 0.02), ("D", "E", 0.03)])
+    by_size = sorted((frozenset(c) for c in clusters), key=len, reverse=True)
+    assert by_size[0] == frozenset({"A", "B", "C"})
+    assert frozenset({"D", "E"}) in by_size
+
+
+def test_cluster_pairs_empty():
+    assert dupes.cluster_pairs([]) == []

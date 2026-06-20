@@ -5,7 +5,7 @@
 Ассерты толерантны к точным промежуточным узлам — проверяют семантику, не дословный путь.
 """
 import pytest
-from grafit import nav
+from grafit import nav, dupes
 
 NAME = "bpm"
 
@@ -110,3 +110,45 @@ def test_file_imports_excludes_self_for_file_node(graph):
 def test_tests_lookup_finds_handler_tests(graph):
     lines = "\n".join(nav.format_tests(graph, NAME, "LoginCommandHandler"))
     assert "LoginCommandHandlerTests" in lines
+
+
+# --- дубликаты: режим similar (node-to-node) ---
+
+def test_similar_finds_cross_file_duplicate(graph):
+    # .BuildExportDto() продублирован в двух export-хендлерах (PoC-находка, dist≈0.0006)
+    res = dupes.similar(graph, "BuildExportDto", k=6, threshold=0.10)
+    assert res is not None
+    sfs = {c[3] for c in res["candidates"]}
+    assert any("ExportProcessVersionModel" in s or "ExportCurrentProcessModel" in s for s in sfs), \
+        f"ожидался дубль BuildExportDto в другом export-хендлере, получено: {sfs}"
+
+
+def test_similar_excludes_same_file_colocation(graph):
+    # Command и Handler лежат рядом и графово связаны — это НЕ дубль, не должны попасть
+    res = dupes.similar(graph, "LoginCommand", k=8, threshold=0.10)
+    assert res is not None
+    labels = {c[1] for c in res["candidates"]}
+    assert "LoginCommandHandler" not in labels
+    assert "LoginCommandValidator" not in labels
+
+
+def test_similar_unknown_symbol_returns_none(graph):
+    assert dupes.similar(graph, "NoSuchSymbolXYZ123") is None
+
+
+# --- дубликаты: глобальный скан ---
+
+def test_find_duplicates_surfaces_authorization_handlers(graph):
+    # HandleRequirementAsync скопирован в OrganizationAdmin/User/Contributor-хендлерах
+    clusters = dupes.find_duplicates(graph, kind="prod", threshold=0.06)
+    joined = "\n".join(
+        m[2] for c in clusters for m in c["members"])
+    assert "OrganizationAdminAuthorizationHandler" in joined
+    assert "OrganizationUserAuthorizationHandler" in joined
+
+
+def test_find_duplicates_skips_framework_handle_by_default(graph):
+    # голый .Handle() (MediatR-шаблон) по умолчанию не должен плодить кластеры
+    clusters = dupes.find_duplicates(graph, kind="prod", threshold=0.06)
+    bare_handle = [m for c in clusters for m in c["members"] if nav._norm(m[1]) == "handle"]
+    assert bare_handle == [], f"шаблонные .Handle() просочились: {bare_handle}"
