@@ -136,6 +136,16 @@ def test_similar_unknown_symbol_returns_none(graph):
     assert dupes.similar(graph, "NoSuchSymbolXYZ123") is None
 
 
+def test_similar_drops_reference_fragments(graph):
+    # co-located тип-узлы (Process/ProcessVersion как параметры метода) — usage, не дубли:
+    # фильтр reference-фрагментов должен их убрать, оставив реальный клон метода
+    res = dupes.similar(graph, "BuildExportDto", k=8, threshold=0.10)
+    assert res is not None
+    labels = {c[1] for c in res["candidates"]}
+    assert ".BuildExportDto()" in labels                 # реальный клон жив
+    assert "Process" not in labels and "ProcessVersion" not in labels
+
+
 # --- дубликаты: глобальный скан ---
 
 def test_find_duplicates_surfaces_authorization_handlers(graph):

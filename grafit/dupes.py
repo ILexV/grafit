@@ -143,6 +143,17 @@ def _linked_ids(graph, node_id: str) -> set:
     return {r[0] for r in rs}
 
 
+def fragment_ids(graph, nodes) -> set:
+    """id узлов-ФРАГМЕНТОВ среди nodes: per-use упоминание типа/символа (рёбра только
+    references/imports) или стаб без sf/loc — это НЕ определение, а usage. Для дубль-поиска
+    ложные «клоны»: тип/enum, используемый в N файлах, иначе слипается в фейк-кластер
+    (AuditLogStatus ×12) и сшивает реальные находки транзитивно. Делегирует nav._is_fragment.
+    nodes — любые кортежи с (id,label,ft,sf,loc) в первых 5 позициях. Один запрос на пачку."""
+    relmap = nav._rel_map(graph, [n[0] for n in nodes])
+    return {n[0] for n in nodes
+            if nav._is_fragment((n[0], n[1], n[2], n[3], n[4]), relmap)}
+
+
 # --- режим 1: дубли одного символа ------------------------------------------------
 
 def similar(graph, symbol: str, k: int = 6, threshold: float = 0.10,
@@ -160,9 +171,10 @@ def similar(graph, symbol: str, k: int = 6, threshold: float = 0.10,
         return {"resolved": r, "candidates": []}
     linked = _linked_ids(graph, r["id"])
     rows = nearest(graph, qvec, max(k * 8, 40))
+    frag = fragment_ids(graph, rows)               # usage-узлы типа/символа — не дубли
     out = []
     for nid, label, ft, sf, loc, text, dist in rows:
-        if nid == r["id"] or nid in linked:
+        if nid == r["id"] or nid in linked or nid in frag:
             continue
         if is_noise_label(label) or not is_symbol_node(label, sf):
             continue
@@ -209,7 +221,8 @@ def _scan_nodes(graph, kind: str, include_framework: bool):
         if (is_noise_label if not include_framework else common.is_generic)(label):
             continue
         keep.append((nid, label, ft, sf, loc, emb))
-    return keep
+    frag = fragment_ids(graph, keep)               # отсев usage-узлов (тип/enum used-everywhere)
+    return [n for n in keep if n[0] not in frag]
 
 
 def _all_linked(graph) -> set:
