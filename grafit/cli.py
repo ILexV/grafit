@@ -229,7 +229,8 @@ def _dupes(args):
     fresh = common.freshness_line(name, live_root=(None if args.graph else common.project_root()))
     reranker = search.get_reranker(threads=args.threads)[0] if args.rerank else None
     root = common.project_root() if args.snippet else None
-    print("\n".join([fresh] + dupes.format_duplicates(
+    fmt = dupes.format_pairs if args.pairs else dupes.format_duplicates
+    print("\n".join([fresh] + fmt(
         g, name, kind=args.kind, threshold=args.threshold, topk=args.topk, limit=args.limit,
         include_framework=args.include_framework, reranker=reranker, root=root)))
 
@@ -326,7 +327,9 @@ def main():
                    default="prod")
     p.add_argument("--threshold", type=float, default=0.06, help="макс. косинусная дистанция пары")
     p.add_argument("--topk", type=int, default=4, help="соседей на узел при скане")
-    p.add_argument("--limit", type=int, default=20, help="сколько кластеров показать")
+    p.add_argument("--limit", type=int, default=20, help="сколько кластеров/пар показать")
+    p.add_argument("--pairs", action="store_true",
+                   help="плоский список пар вместо кластеров (не раздувается транзитивно)")
     p.add_argument("--include-framework", action="store_true",
                    help="включить шаблонные методы (.Handle()/…) — обычно шум")
     p.add_argument("--snippet", action="store_true", help="строки исходника у членов кластера")

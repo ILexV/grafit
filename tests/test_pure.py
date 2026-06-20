@@ -192,6 +192,57 @@ def test_pair_key_is_order_independent():
     assert dupes.pair_key("a", "b") == dupes.pair_key("b", "a") == ("a", "b")
 
 
+# --- dupes.shingles / jaccard (второй сигнал — буквальность) ---
+
+def test_shingles_kgrams_of_tokens():
+    sh = dupes.shingles("a b c d", k=2)
+    assert sh == frozenset({"a b", "b c", "c d"})
+
+
+def test_shingles_short_text_fallback():
+    assert dupes.shingles("a b", k=4) == frozenset({"a b"})
+    assert dupes.shingles("", k=4) == frozenset()
+
+
+def test_jaccard_identical_and_disjoint():
+    a = dupes.shingles("foo bar baz qux", k=2)
+    assert dupes.jaccard(a, a) == 1.0
+    assert dupes.jaccard(a, dupes.shingles("zzz www yyy", k=2)) == 0.0
+    assert dupes.jaccard(a, frozenset()) == 0.0
+
+
+def test_jaccard_partial_overlap_literal_vs_semantic():
+    # сильно пересекающийся текст → выше порога копипаста; разный → ниже
+    copy = dupes.jaccard(dupes.shingles("if x return a else return b plus c", k=3),
+                         dupes.shingles("if x return a else return b plus d", k=3))
+    assert copy >= dupes.LITERAL_JACCARD
+    diff = dupes.jaccard(dupes.shingles("parse json from response body now", k=3),
+                         dupes.shingles("compute average salary for department", k=3))
+    assert diff < dupes.LITERAL_JACCARD
+
+
+# --- dupes.is_interface_member (аннотация «реализации контракта») ---
+
+def test_interface_member_by_filename_and_path():
+    assert dupes.is_interface_member(".CreateAsync()", "Common/Audit/IAuditRegistry.cs") is True
+    assert dupes.is_interface_member(".Foo()", "Domain/Interfaces/Service.cs") is True
+    assert dupes.is_interface_member(".Foo()", "Application/Audit/AuditRegistry.cs") is False
+
+
+# --- dupes._cluster_score (порядок по выгоде) / dist_histogram ---
+
+def test_cluster_score_prefers_bigger_tighter_literal():
+    big = dupes._cluster_score(size=22, min_dist=0.0001, max_jaccard=0.9)
+    pair = dupes._cluster_score(size=2, min_dist=0.0006, max_jaccard=0.1)
+    assert big > pair
+
+
+def test_dist_histogram_buckets():
+    pairs = [{"dist": 0.001}, {"dist": 0.015}, {"dist": 0.025}]
+    hist = dict(dupes.dist_histogram(pairs, bucket=0.02))
+    assert hist[0.02] == 2 and hist[0.04] == 1     # 0.001,0.015 → ≤0.02; 0.025 → ≤0.04
+
+
 # --- dupes.cluster_pairs (union-find кластеризация) ---
 
 def test_cluster_pairs_transitive_merge():

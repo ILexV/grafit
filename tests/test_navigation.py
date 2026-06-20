@@ -162,3 +162,36 @@ def test_find_duplicates_skips_framework_handle_by_default(graph):
     clusters = dupes.find_duplicates(graph, kind="prod", threshold=0.06)
     bare_handle = [m for c in clusters for m in c["members"] if nav._norm(m[1]) == "handle"]
     assert bare_handle == [], f"шаблонные .Handle() просочились: {bare_handle}"
+
+
+# --- обогащение: Jaccard, score-сортировка, аннотации ---
+
+def test_clusters_carry_annotations_and_score_sorted(graph):
+    clusters = dupes.find_duplicates(graph, kind="prod", threshold=0.06)
+    assert clusters
+    for c in clusters:                               # все новые поля присутствуют
+        assert {"max_jaccard", "literal", "shared_name", "contract", "score"} <= c.keys()
+        assert 0.0 <= c["max_jaccard"] <= 1.0
+    scores = [c["score"] for c in clusters]
+    assert scores == sorted(scores, reverse=True)    # сортировка по выгоде (убывание score)
+    # хотя бы один кластер — «один метод в N местах» (shared_name проставлен)
+    assert any(c["shared_name"] for c in clusters)
+
+
+def test_duplicate_pairs_sorted_literal_first(graph):
+    pairs = dupes.duplicate_pairs(graph, kind="prod", threshold=0.06)
+    assert pairs
+    for p in pairs:
+        assert 0.0 <= p["jaccard"] <= 1.0
+        assert p["literal"] == (p["jaccard"] >= dupes.LITERAL_JACCARD)
+    # буквальные (высокий Jaccard) идут раньше семантических
+    jacc = [p["jaccard"] for p in pairs]
+    assert jacc == sorted(jacc, reverse=True)
+
+
+def test_similar_candidates_carry_jaccard(graph):
+    res = dupes.similar(graph, "BuildExportDto", k=6, threshold=0.10)
+    assert res and res["candidates"]
+    top = res["candidates"][0]                        # (id,label,ft,sf,loc,text,dist,jaccard)
+    assert len(top) == 8
+    assert 0.0 <= top[7] <= 1.0

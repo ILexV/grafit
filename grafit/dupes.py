@@ -18,6 +18,7 @@
   find_duplicates() — глобальный скан проекта → кластеры дублей (union-find по парам).
 """
 from __future__ import annotations
+import re
 from . import common, nav
 
 # Столбцы узла-кандидата (порядок фиксирован — на него опираются форматтеры/фильтры).
@@ -78,6 +79,20 @@ _FAMILY_SUFFIXES = ("Handler", "Validator", "Command", "Query", "Endpoint",
                     "Response", "Request", "Result")
 
 
+def is_interface_member(label: str | None, sf: str | None) -> bool:
+    """Узел — объявление в ИНТЕРФЕЙСЕ/контракте (а не реализация)? Для аннотации #4: кластер
+    одинаковых методов, где есть член-интерфейс, — это реализации одного контракта, и подсказка
+    «вынеси базовый/template-метод» точнее, чем «дубль». Эвристика по имени файла/символа:
+    C#-конвенция `IFoo` (PascalCase с I-префиксом) или путь `/Interfaces/`."""
+    base = (sf or "").rsplit("/", 1)[-1]
+    if len(base) >= 2 and base[0] == "I" and base[1].isupper():
+        return True
+    if "/interfaces/" in (sf or "").lower():
+        return True
+    bl = nav._bare(label)
+    return len(bl) >= 2 and bl[0] == "I" and bl[1].isupper()
+
+
 def is_family_pair(a_label: str | None, b_label: str | None) -> bool:
     """Пара — члены одной именной семьи (XCommand ↔ XCommandHandler/Validator/…)?
 
@@ -94,6 +109,33 @@ def is_family_pair(a_label: str | None, b_label: str | None) -> bool:
 def pair_key(a_id: str, b_id: str) -> tuple[str, str]:
     """Ненаправленный ключ пары (для дедупа A↔B == B↔A)."""
     return (a_id, b_id) if a_id <= b_id else (b_id, a_id)
+
+
+# --- токенные шинглы: второй сигнал, ортогональный вектору -------------------------
+# Косинус эмбеддинга ловит «делает похожее» (семантика), Jaccard k-грамм токенов — «буквально
+# тот же текст» (копипаст). Их сочетание делит находки: высокий Jaccard = literal-copy (сливать
+# в общий код почти наверняка), низкий Jaccard при близком векторе = семантический дубль
+# (похожая логика, но другой текст — решать человеку). Источник текста — сниппет тела узла.
+_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[^\sA-Za-z0-9_]")
+LITERAL_JACCARD = 0.45        # порог «это буквальный копипаст», откалиброван на bpm/core_ledger
+
+
+def shingles(text: str | None, k: int = 4) -> frozenset:
+    """Множество k-грамм токенов исходника (для Jaccard-оценки буквального совпадения).
+    Токен = идентификатор или одиночный знак пунктуации; k-грамма устойчивее к переименованию
+    отдельных переменных, чем сравнение по словам. Чистая функция — тестируется напрямую."""
+    toks = _TOKEN_RE.findall(text or "")
+    if len(toks) < k:
+        return frozenset([" ".join(toks)]) if toks else frozenset()
+    return frozenset(" ".join(toks[i:i + k]) for i in range(len(toks) - k + 1))
+
+
+def jaccard(a: frozenset, b: frozenset) -> float:
+    """|A∩B| / |A∪B| — доля общих шинглов (0..1). 0 при пустом любом из множеств."""
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    return inter / (len(a) + len(b) - inter)
 
 
 def cluster_pairs(pairs: list[tuple]) -> list[set]:
@@ -129,6 +171,13 @@ def node_embedding(graph, node_id: str):
     rs = graph.query("MATCH (n:Entity {id:$id}) RETURN n.embedding",
                      params={"id": node_id}).result_set
     return list(rs[0][0]) if rs and rs[0][0] is not None else None
+
+
+def node_text(graph, node_id: str) -> str:
+    """Текст узла (имя+сниппет+doc) по id — для Jaccard-шинглов anchor-символа."""
+    rs = graph.query("MATCH (n:Entity {id:$id}) RETURN n.text",
+                     params={"id": node_id}).result_set
+    return (rs[0][0] if rs and rs[0][0] else "") or ""
 
 
 def nearest(graph, qvec, k: int):
@@ -191,8 +240,12 @@ def similar(graph, symbol: str, k: int = 6, threshold: float = 0.10,
             break
     out.sort(key=lambda x: x[6])
     if reranker is not None and out:
-        out = _rerank_pairs(reranker, r.get("text") or r["label"], out)
-    return {"resolved": r, "candidates": out[:k]}
+        out = _rerank_pairs(reranker, node_text(graph, r["id"]) or r["label"], out)
+    out = out[:k]
+    # Второй сигнал: Jaccard шинглов anchor↔кандидат — копипаст (высокий) vs семантика (низкий)
+    ash = shingles(node_text(graph, r["id"]))
+    out = [(*row, jaccard(ash, shingles(row[5]))) for row in out]
+    return {"resolved": r, "candidates": out}
 
 
 def _rerank_pairs(reranker, anchor_text, rows):
@@ -207,20 +260,21 @@ def _rerank_pairs(reranker, anchor_text, rows):
 # --- режим 2: глобальный скан проекта ---------------------------------------------
 
 def _scan_nodes(graph, kind: str, include_framework: bool):
-    """Узлы-кандидаты с эмбеддингами под фильтром kind, без шумовых имён."""
+    """Узлы-кандидаты под фильтром kind, без шумовых имён. Кортеж (id,label,ft,sf,loc,text,emb):
+    text для Jaccard-шинглов, emb для векторного поиска."""
     rs = graph.query(
         "MATCH (n:Entity) WHERE n.embedding IS NOT NULL "
-        "RETURN n.id, n.label, n.file_type, n.source_file, n.source_location, n.embedding"
+        "RETURN n.id, n.label, n.file_type, n.source_file, n.source_location, n.text, n.embedding"
     ).result_set
     keep = []
-    for nid, label, ft, sf, loc, emb in rs:
+    for nid, label, ft, sf, loc, text, emb in rs:
         if not common.kind_matches(sf, ft, kind):
             continue
         if not is_symbol_node(label, sf):
             continue
         if (is_noise_label if not include_framework else common.is_generic)(label):
             continue
-        keep.append((nid, label, ft, sf, loc, emb))
+        keep.append((nid, label, ft, sf, loc, text, emb))
     frag = fragment_ids(graph, keep)               # отсев usage-узлов (тип/enum used-everywhere)
     return [n for n in keep if n[0] not in frag]
 
@@ -231,23 +285,17 @@ def _all_linked(graph) -> set:
     return {pair_key(a, b) for a, b in rs}
 
 
-def find_duplicates(graph, kind: str = "prod", threshold: float = 0.06, topk: int = 4,
-                    include_framework: bool = False, reranker=None) -> list[dict]:
-    """Глобальный скан: кластеры near-duplicate символов по проекту (кандидаты на рефакторинг).
-
-    Для каждого узла берём top-k соседей по вектору, копим МЕЖФАЙЛОВЫЕ не-связанные пары
-    с dist ≤ threshold, кластеризуем (union-find). Возвращает список кластеров, отсортированных
-    по плотности (минимальная внутренняя дистанция): [{members:[(id,label,sf,loc)], min_dist, ...}].
-    """
+def _collect_pairs(graph, kind: str, threshold: float, topk: int,
+                   include_framework: bool, reranker):
+    """Скан проекта → (meta, pair_info). pair_info[key] = (dist, jaccard): косинус-дистанция
+    (семантика) и Jaccard шинглов (буквальность). Это общее ядро для кластеров и режима пар."""
     nodes = _scan_nodes(graph, kind, include_framework)
     linked = _all_linked(graph)
     meta = {n[0]: n for n in nodes}
-    pairs: dict = {}                                # key -> dist (минимальная встреченная)
-    for nid, label, ft, sf, loc, emb in nodes:
+    dist_of: dict = {}
+    for nid, label, ft, sf, loc, text, emb in nodes:
         for hid, hlabel, hft, hsf, hloc, htext, dist in nearest(graph, list(emb), topk + 1):
-            if hid == nid or hid not in meta:
-                continue
-            if dist > threshold:
+            if hid == nid or hid not in meta or dist > threshold:
                 continue
             if sf and hsf and sf == hsf:            # co-location — не клон
                 continue
@@ -256,20 +304,81 @@ def find_duplicates(graph, kind: str = "prod", threshold: float = 0.06, topk: in
             key = pair_key(nid, hid)
             if key in linked:                       # прямая связь — не дубль
                 continue
-            if key not in pairs or dist < pairs[key]:
-                pairs[key] = dist
-    if reranker is not None and pairs:
-        pairs = _rerank_filter(reranker, pairs, meta)
-    pair_list = [(a, b, d) for (a, b), d in pairs.items()]
+            if key not in dist_of or dist < dist_of[key]:
+                dist_of[key] = dist
+    if reranker is not None and dist_of:
+        dist_of = _rerank_filter(reranker, dist_of, meta)
+    shcache: dict = {}
+
+    def sh(i):                                       # шинглы тела узла, кэш по id
+        return shcache.setdefault(i, shingles(meta[i][5]))
+    pair_info = {key: (d, jaccard(sh(key[0]), sh(key[1]))) for key, d in dist_of.items()}
+    return meta, pair_info
+
+
+def _cluster_score(size: int, min_dist: float, max_jaccard: float) -> float:
+    """Эвристика «выгоды рефакторинга» для сортировки: больше членов × ближе × буквальнее —
+    выше. Кластер из 22 идентичных методов важнее тесной пары из двух. Только для порядка."""
+    return size * (1.0 + max_jaccard) / (min_dist + 0.005)
+
+
+def find_duplicates(graph, kind: str = "prod", threshold: float = 0.06, topk: int = 4,
+                    include_framework: bool = False, reranker=None) -> list[dict]:
+    """Глобальный скан: кластеры near-duplicate символов по проекту (кандидаты на рефакторинг).
+
+    Межфайловые не-связанные пары (dist ≤ threshold) кластеризуются (union-find). Кластер несёт:
+    min/max_dist, max_jaccard (буквальность), literal (копипаст vs семантика), shared_name (один
+    метод в N местах), contract (реализации интерфейса → extract base), score (порядок по выгоде).
+    Сортировка — по score (крупные тесные буквальные первыми)."""
+    meta, pair_info = _collect_pairs(graph, kind, threshold, topk, include_framework, reranker)
+    pair_list = [(a, b, d) for (a, b), (d, j) in pair_info.items()]
     clusters = []
     for ids in cluster_pairs(pair_list):
-        dists = [d for a, b, d in pair_list if a in ids and b in ids]
+        intra = [pair_info[k] for k in pair_info if k[0] in ids and k[1] in ids]
+        dists = [d for d, j in intra]
+        jaccs = [j for d, j in intra]
         members = [(i, meta[i][1], meta[i][3], meta[i][4]) for i in ids if i in meta]
         members.sort(key=lambda m: (m[2], m[3]))
-        clusters.append({"members": members, "min_dist": min(dists),
-                         "max_dist": max(dists), "size": len(members)})
-    clusters.sort(key=lambda c: (c["min_dist"], -c["size"]))
+        names = {nav._norm(m[1]) for m in members}
+        max_j = max(jaccs) if jaccs else 0.0
+        contract = (len(names) == 1
+                    and any(is_interface_member(m[1], m[2]) for m in members))
+        clusters.append({
+            "members": members, "min_dist": min(dists), "max_dist": max(dists),
+            "size": len(members), "max_jaccard": max_j,
+            "literal": max_j >= LITERAL_JACCARD,
+            "shared_name": next(iter(names)) if len(names) == 1 else None,
+            "contract": contract,
+            "score": _cluster_score(len(members), min(dists), max_j),
+        })
+    clusters.sort(key=lambda c: -c["score"])
     return clusters
+
+
+def duplicate_pairs(graph, kind: str = "prod", threshold: float = 0.06, topk: int = 4,
+                    include_framework: bool = False, reranker=None) -> list[dict]:
+    """То же ядро, но плоский список ПАР (без транзитивной кластеризации — не раздувается).
+    Пара: {a,b:(label,sf,loc), dist, jaccard, literal}. Сортировка — буквальные и тесные первыми."""
+    meta, pair_info = _collect_pairs(graph, kind, threshold, topk, include_framework, reranker)
+    out = []
+    for (a, b), (d, j) in pair_info.items():
+        out.append({"a": (meta[a][1], meta[a][3], meta[a][4]),
+                    "b": (meta[b][1], meta[b][3], meta[b][4]),
+                    "dist": d, "jaccard": j, "literal": j >= LITERAL_JACCARD,
+                    "shared_name": nav._norm(meta[a][1]) == nav._norm(meta[b][1])})
+    out.sort(key=lambda p: (-(p["jaccard"]), p["dist"]))
+    return out
+
+
+def dist_histogram(pairs_or_clusters, bucket: float = 0.02) -> list[tuple]:
+    """Распределение дистанций по корзинам ширины bucket — для подсказки порога (#7).
+    Принимает список пар (dict с 'dist') или кластеров (берёт min_dist). [(верх_корзины, кол-во)]."""
+    hist: dict = {}
+    for x in pairs_or_clusters:
+        d = x.get("dist", x.get("min_dist", 0.0))
+        b = round((int(d / bucket) + 1) * bucket, 4)
+        hist[b] = hist.get(b, 0) + 1
+    return sorted(hist.items())
 
 
 def _rerank_filter(reranker, pairs: dict, meta: dict, keep_ratio: float = 0.75) -> dict:
@@ -296,6 +405,11 @@ def _snip(root, sf, loc, cache):
         if root else []
 
 
+def _tag(literal: bool, jacc: float) -> str:
+    """Метка природы дубля по Jaccard: буквальный копипаст vs семантически похожий код."""
+    return f"копипаст J={jacc:.2f}" if literal else f"семантика J={jacc:.2f}"
+
+
 def format_similar(graph, name: str, symbol: str, k: int = 6, threshold: float = 0.10,
                    kind: str = "all", reranker=None, root=None) -> list[str]:
     res = similar(graph, symbol, k=k, threshold=threshold, kind=kind, reranker=reranker)
@@ -309,10 +423,22 @@ def format_similar(graph, name: str, symbol: str, k: int = 6, threshold: float =
         out.append("  похожих узлов в пределах порога нет (это хорошо — дублей не видно)")
         return out
     cache: dict = {}
-    for nid, label, ft, sf, loc, text, dist in cands:
-        out.append(f"\n  ≈{dist:.4f}  {label} ({ft})\n          {sf}:{loc}")
+    for nid, label, ft, sf, loc, text, dist, jacc in cands:
+        out.append(f"\n  ≈{dist:.4f}  [{_tag(jacc >= LITERAL_JACCARD, jacc)}]  {label} ({ft})"
+                   f"\n          {sf}:{loc}")
         out.extend(_snip(root, sf, loc, cache))
     return out
+
+
+def _hist_lines(items) -> list[str]:
+    """Строки распределения дистанций (подсказка порога #7)."""
+    hist = dist_histogram(items)
+    if not hist:
+        return []
+    lines = ["  распределение dist (для подбора порога):"]
+    for top, cnt in hist:
+        lines.append(f"    ≤{top:.2f}: {cnt:4d}  {'█' * min(40, cnt)}")
+    return lines
 
 
 def format_duplicates(graph, name: str, kind: str = "prod", threshold: float = 0.06,
@@ -320,17 +446,49 @@ def format_duplicates(graph, name: str, kind: str = "prod", threshold: float = 0
                       reranker=None, root=None) -> list[str]:
     clusters = find_duplicates(graph, kind=kind, threshold=threshold, topk=topk,
                                include_framework=include_framework, reranker=reranker)
-    out = [f"[{name}] дубликаты (kind={kind}, dist≤{threshold}): "
-           f"{len(clusters)} кластеров"]
+    lit = sum(1 for c in clusters if c["literal"])
+    out = [f"[{name}] дубликаты (kind={kind}, dist≤{threshold}): {len(clusters)} кластеров "
+           f"({lit} копипаст / {len(clusters) - lit} семантика), сортировка по выгоде"]
     if not clusters:
         out.append("  near-duplicate символов в пределах порога не найдено")
         return out
+    out.extend(_hist_lines(clusters))
     cache: dict = {}
     for c in clusters[:limit]:
-        out.append(f"\n● кластер ×{c['size']}  (dist {c['min_dist']:.4f}–{c['max_dist']:.4f})")
+        tags = [_tag(c["literal"], c["max_jaccard"])]
+        if c["shared_name"]:
+            tags.append(f"один метод ×{c['size']}")
+        if c["contract"]:
+            tags.append("реализации контракта → extract base/template method")
+        out.append(f"\n● ×{c['size']}  dist {c['min_dist']:.4f}–{c['max_dist']:.4f}  "
+                   f"[{' · '.join(tags)}]")
         for nid, label, sf, loc in c["members"]:
             out.append(f"    {label}   {sf}:{loc}")
             out.extend(_snip(root, sf, loc, cache))
     if len(clusters) > limit:
         out.append(f"\n  (+{len(clusters) - limit} кластеров ещё — сузь порог или подними limit)")
+    return out
+
+
+def format_pairs(graph, name: str, kind: str = "prod", threshold: float = 0.06, topk: int = 4,
+                 limit: int = 30, include_framework: bool = False, reranker=None,
+                 root=None) -> list[str]:
+    """Плоский список ПАР (не кластеры) — не раздувается транзитивно, точнее для «что с чем
+    сливать». Буквальные (копипаст) первыми."""
+    pairs = duplicate_pairs(graph, kind=kind, threshold=threshold, topk=topk,
+                            include_framework=include_framework, reranker=reranker)
+    lit = sum(1 for p in pairs if p["literal"])
+    out = [f"[{name}] дубль-пары (kind={kind}, dist≤{threshold}): {len(pairs)} пар "
+           f"({lit} копипаст / {len(pairs) - lit} семантика)"]
+    if not pairs:
+        out.append("  near-duplicate пар в пределах порога не найдено")
+        return out
+    out.extend(_hist_lines(pairs))
+    for p in pairs[:limit]:
+        (la, sfa, loca), (lb, sfb, locb) = p["a"], p["b"]
+        out.append(f"\n  ≈{p['dist']:.4f}  [{_tag(p['literal'], p['jaccard'])}]  {la} ↔ {lb}")
+        out.append(f"          {sfa}:{loca}")
+        out.append(f"          {sfb}:{locb}")
+    if len(pairs) > limit:
+        out.append(f"\n  (+{len(pairs) - limit} пар ещё)")
     return out

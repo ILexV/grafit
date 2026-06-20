@@ -267,25 +267,30 @@ def grafit_similar(symbol: str, project: str = "", k: int = 6, threshold: float 
 
 @mcp.tool()
 def grafit_dupes(project: str = "", kind: str = "prod", threshold: float = 0.06,
-                 limit: int = 20, include_framework: bool = False, rerank: bool = False,
-                 snippet: bool = False) -> str:
-    """Глобальный скан дубликатов кода по всему проекту — кластеры near-duplicate символов
-    для рефакторинга. Для каждого узла берёт ближайших по вектору, копит МЕЖФАЙЛОВЫЕ
-    не-связанные пары (dist≤threshold) и кластеризует транзитивно (A~B, B~C ⇒ {A,B,C}).
+                 limit: int = 20, pairs: bool = False, include_framework: bool = False,
+                 rerank: bool = False, snippet: bool = False) -> str:
+    """Глобальный скан дубликатов кода по всему проекту — кандидаты на рефакторинг. Для каждого
+    узла берёт ближайших по вектору, копит МЕЖФАЙЛОВЫЕ не-связанные пары (dist≤threshold).
     Дороже grafit_similar (скан всего графа) — зови для аудита/«где у нас копипаст».
 
+    Каждая находка помечена ДВУМЯ сигналами: dist (косинус, семантика) и Jaccard шинглов —
+    `копипаст` (буквально тот же текст, сливать почти наверняка) vs `семантика` (похожая логика,
+    другой текст — решать). Кластеры с одним именем метода и членом-интерфейсом помечаются
+    `реализации контракта → extract base/template method`. Сортировка по «выгоде» (размер×тесность).
+
     kind:               по умолчанию prod (код без тестов/миграций/генерёнки).
-    threshold:          максимальная косинусная дистанция пары (дефолт 0.06; ниже — строже).
+    threshold:          максимальная косинусная дистанция пары (дефолт 0.06; гистограмма в выводе).
+    pairs:              плоский список ПАР вместо кластеров (не раздувается транзитивно; «что с чем»).
     include_framework:  включить шаблонные методы (.Handle()/…) — обычно шум, по умолч. выкл.
     rerank:             кросс-энкодером отсеять структурно-похожие, но разные по смыслу пары.
-    snippet:            показать строки исходника у каждого члена кластера."""
+    snippet:            показать строки исходника у каждого члена (только для кластеров)."""
     g, name = _graph(project or None)
     reranker = search.get_reranker(threads=THREADS)[0] if rerank else None
     root = _root(name) if snippet else None
+    fmt = dupes.format_pairs if pairs else dupes.format_duplicates
     return "\n".join([_fresh(name, project or None)]
-                     + dupes.format_duplicates(g, name, kind=kind, threshold=threshold,
-                                               limit=limit, include_framework=include_framework,
-                                               reranker=reranker, root=root))
+                     + fmt(g, name, kind=kind, threshold=threshold, limit=limit,
+                           include_framework=include_framework, reranker=reranker, root=root))
 
 
 @mcp.tool()
