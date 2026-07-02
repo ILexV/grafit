@@ -169,8 +169,9 @@ graphify watch .          # фоновый процесс (НЕ демон — �
 
 ### 4c. документация (LLM) — через workflow, см. шаг 5
 
-CLI `graphify update` обновляет **только код**. Доки требуют skill-флоу:
-`/graphify --update` (инкрементально, только изменённые файлы — дёшево).
+CLI `graphify update` обновляет **только код**. Доки требуют skill-флоу, но в workflow
+используй lightweight-вариант: пере-экстракть изменённые доки, смержи их в
+`graphify-out/graph.json`, обнови manifest/cache/cost и остановись до cluster/report/html/export.
 
 ---
 
@@ -185,8 +186,10 @@ CLI `graphify update` обновляет **только код**. Доки тр�
 `graphify-out/needs_update`.
 
 **Оркестратор применяет флаг на финализации** (у него есть skill и Bash):
-если `graphify-out/needs_update` существует — вызвать `/graphify --update`, затем
-**снять флаг явно**: `rm -f graphify-out/needs_update`.
+если `graphify-out/needs_update` существует — обновить данные графа в lightweight-режиме
+(re-extract changed files → merge into `graphify-out/graph.json` → update manifest/cache/cost),
+но не перестраивать `GRAPH_REPORT.md`/`graph.html`, затем **снять флаг явно**:
+`rm -f graphify-out/needs_update`.
 
 ⚠️ Имя флага — `needs_update` (без точки), а штатный cleanup в SKILL.md удаляет
 `.needs_update` (с точкой) — рассинхрон в самом graphify. Поэтому снимай сам, иначе флаг
