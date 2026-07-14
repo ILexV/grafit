@@ -525,7 +525,7 @@ def read_leading_comments(root, source_file, loc, cache=None, max_scan=15, max_c
     lines = _file_lines(root, source_file, cache)
     if not lines:
         return ""
-    i = int(nums[0]) - 2        # строка НАД объявлением (0-индекс: сама декларация = start-1)
+    i = min(int(nums[0]) - 2, len(lines) - 1)  # строка НАД объявлением; stale loc может быть за EOF
     out, scanned = [], 0
     while i >= 0 and scanned < max_scan:
         s = lines[i].strip()
