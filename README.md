@@ -79,15 +79,31 @@ CLS→mean pooling между версиями). Поэтому fastembed **за
 ```json
 { "mcpServers": { "grafit": { "command": "grafit", "args": ["mcp"] } } }
 ```
-Инструменты: `grafit_search`, `grafit_list_projects`, `grafit_explain`, `grafit_find_path`,
-`grafit_status`, `grafit_tests`, `grafit_impact`, `grafit_trace`, `grafit_similar`,
-`grafit_dupes`. Проект определяется по текущей папке клиента (или параметром `project`).
+Инструменты: `grafit_search`, `grafit_find_existing`, `grafit_impact`, `grafit_tests`,
+`grafit_explain`, `grafit_trace`, `grafit_similar`, `grafit_dupes`, `grafit_status`
+(+ редкие `grafit_find_path`, `grafit_list_projects`). Проект определяется по текущей папке
+клиента (или параметром `project`).
 
-Каждый ответ начинается со **строки свежести** графа (на каком коммите построен, отстал ли
-от HEAD, грязно ли дерево). У `grafit_search` есть `kind` — фильтр узлов `all|code|tests|docs|prod`
-(`prod` = код без тестов/миграций/генерёнки) и `snippet` — подмешать реальные строки исходника
-(source-first, экономит чтение файла; `grafit_explain` показывает их по умолчанию). Связи
-помечены: `─` структурная (из AST), `⋯ … (inferred)` — выводная (по смыслу).
+- **`grafit_find_existing(description)`** — ПЕРЕД написанием нового метода/класса/сервиса:
+  опиши назначение словами → похожий существующий код со score (главный сценарий: не плодить
+  почти-дубли, которые grep не находит из-за других имён).
+- **`grafit_search(question, kind="prod")`** — разведка «где/как реализовано X». По умолчанию
+  `kind=prod` (код без тестов/доков/генерёнки); `all|code|tests|docs|frontend|backend`.
+  Один узел на `path:line`, reference-фрагменты скрыты. У каждого узла **score** (близость
+  0..1) и вердикт: сильное / слабое / **«ничего похожего»** (такого кода, вероятно, нет).
+  Фильтр отсёк всё — честный пустой ответ с подсказкой `kind=all`, а не подмена выдачи.
+- **`grafit_similar(symbol, file=…)`** — с `file` символ читается из РАБОЧЕГО ДЕРЕВА (даже
+  если его ещё нет в графе): проверка на приёмке, что новое не дублирует старое.
+
+Каждый ответ начинается со **строки свежести** (см. ниже); узлы из файлов, изменённых после
+сборки, помечены `⚠ изменён после сборки`. Цитаты (`snippet`) сверяются с именем узла: если
+по старому номеру строки имени нет — «строка сместилась» и где символ сейчас, а не чужой код.
+Связи помечены: `─` структурная (из AST), `⋯ … (inferred)` — выводная (по смыслу).
+
+Переменные MCP-сервера: `GRAFIT_TOOLS=all|core|search,impact,…` (`core` скрывает редкие),
+`GRAFIT_USAGE_LOG=0` — выключить журнал `~/.grafit/usage.jsonl` (инструмент, проект, время,
+мс, число результатов, длина запроса — без текста запроса), `GRAFIT_STRONG_DIST` /
+`GRAFIT_NONE_DIST` — пороги дистанции (0.175 / 0.20 для multilingual-e5-large).
 
 ### Навигация по графу (без эмбеддингов)
 Направленный обход типизированных рёбер — для работы перед изменением:
@@ -158,37 +174,36 @@ references/imports вместо «не найдено».
 
 - **`grafit status`** (CLI и MCP-инструмент `grafit_status`) — отчёт: на каком коммите граф,
   насколько HEAD ушёл вперёд, грязно ли рабочее дерево. `--all` — по всем графам.
-- **Строка свежести** идёт шапкой к каждому ответу `grafit_search`/`explain`/`find_path`/`query`:
-  `граф @ abc123 · свежий` либо `⚠ … HEAD +N · дерево грязное — перезалей`.
-- Состояния: `fresh` (совпал, чисто) · `dirty` (несохранённые правки — граф их не видит) ·
-  `behind:N` (HEAD ушёл вперёд) · `diverged` (ребейз/другая ветка) · `unknown` (старый граф
-  без метки / вне git).
+- **Строка свежести** идёт шапкой к каждому ответу: файлы КОДА, изменённые после сборки
+  (`git diff <коммит сборки>` + незакоммиченное), с учётом `.graphifyignore`. Коммиты только с
+  доками граф устаревшим не делают. Мягко: `граф @ abc · HEAD +3 · изменены после сборки (2):
+  a.cs, b.ts — их перепроверь; остальное актуально`. Тревога `⚠ … сильно отстал` — только при
+  >30 файлах кода или >50 коммитах (`GRAFIT_STALE_ALARM_FILES` / `GRAFIT_STALE_ALARM_COMMITS`).
+- Состояния: `fresh` · `dirty` (незакоммиченные правки) · `behind:N` · `diverged` (ребейз/
+  другая ветка) · `unknown` (старый граф без метки / вне git).
 
-Граф, залитый старой версией grafit, метки не имеет — `status` это честно покажет и
-предложит перезалить. Метаданные появляются при первом `grafit load` после обновления.
+## Авто-обновление графа (`grafit refresh`, `grafit hook install`)
+Цепочка: правки кода → graphify обновляет `graphify-out/graph.json` → `grafit load` заливает
+его в FalkorDB → MCP видит свежие данные (коннект к БД на каждый запрос, рестарт не нужен).
 
-## Авто-обновление графа (post-commit)
-Цепочка обновления: правки кода → graphify обновляет `graphify-out/graph.json` →
-**`grafit load`** заливает его в FalkorDB → MCP видит свежие данные (без рестарта,
-коннект к БД на каждый запрос). Шаг `grafit load` можно автоматизировать в git-хуке,
-дождавшись, пока graphify допишет `graph.json`:
+- **`grafit refresh [path]`** — если граф отстал ПО КОДУ: `graphify update .` (без LLM; только
+  если graph.json старше изменённых файлов) → `grafit load`. Узлы из файлов, позже попавших в
+  `.graphifyignore`, инкрементальная пересборка не убирает — refresh это видит и делает
+  `graphify update --force`. `--all-stale` — все графы из `meta.json` по очереди,
+  `--min-commits N`, `--dry-run` — только план. Работает под `nice` (`--nice 10`).
+- **`grafit hook install [path]`** — идемпотентно ставит в `post-commit` (с учётом
+  `core.hooksPath`, относительного и абсолютного) блок после graphify-блока: фоновый
+  `grafit refresh --after-hook` ждёт, пока graphify-хук перепишет graph.json, и заливает.
+  Старые блоки (`# grafit-hook-start`/`# --- grafit-hook-start …` … `grafit-hook-end`, а также
+  неразмеченный `if command -v grafit … fi`) распознаются и заменяются; копия хука —
+  `post-commit.grafit-bak`. `grafit hook uninstall` — убрать. Лог: `~/.cache/grafit-refresh.log`.
+  Пропуск: `GRAFIT_SKIP_HOOK=1`.
+- Конкуренция: на проект — один активный load (flock) + не больше одного отложенного
+  догоняющего прохода (rerun); на машину — не больше `GRAFIT_MAX_LOADS` (по умолч. 1)
+  одновременных заливок разных проектов (общий эмбед-сервис), ожидание до
+  `GRAFIT_LOAD_LOCK_TIMEOUT` (7200 с).
 
-```sh
-# .git/hooks/post-commit (после блока graphify hook)
-if command -v grafit >/dev/null 2>&1; then
-    base=$(stat -c %Y graphify-out/graph.json 2>/dev/null || echo 0)
-    nohup env DIR="$(pwd)" BASE="$base" sh -c '
-        cd "$DIR"; i=0; stable=0; prev=""
-        while [ $i -lt 150 ]; do
-            cur=$(stat -c %Y graphify-out/graph.json 2>/dev/null || echo 0)
-            [ "$cur" -gt "$BASE" ] && { [ "$cur" = "$prev" ] && stable=$((stable+1)) || stable=0; [ $stable -ge 3 ] && break; }
-            prev=$cur; i=$((i+1)); sleep 2
-        done
-        ulimit -v 8000000 2>/dev/null; grafit load
-    ' >>~/.cache/grafit-load.log 2>&1 </dev/null &
-fi
-```
-Документация (LLM-семантика) обновляется отдельно: `graphify --update` → `grafit load`.
+Документация (LLM-семантика) обновляется отдельно: `/graphify --update` → `grafit load`.
 
 ## Порты
 grafit поднимает контейнеры на уникальных хост-портах (127.0.0.1 only):
@@ -205,7 +220,8 @@ grafit поднимает контейнеры на уникальных хос�
 ## Команды
 `grafit up [--no-embed --embed-model M --rebuild-embed]` · `grafit down` ·
 `grafit load [path] [--build --model M --graph N --no-snippets]` ·
-`grafit query "…" [-k --hybrid --rerank --neighbors --kind code|tests|docs|prod --snippet]` ·
+`grafit refresh [path] [--all-stale --min-commits N --dry-run]` · `grafit hook install|uninstall [path]` ·
+`grafit query "…" [-k --neighbors --kind prod|code|tests|docs|all --snippet]` ·
 `grafit status [--graph N --all]` · `grafit tests <symbol>` · `grafit impact <symbol>` ·
 `grafit trace <source> [--to T --with-references --hops N]` · `grafit list` ·
 `grafit eval [--golden file]` · `grafit mcp`

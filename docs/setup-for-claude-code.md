@@ -293,42 +293,31 @@ git commit
 ```
 
 graphify-хук (часть I, шаг 4a) обновляет только `graph.json`. Чтобы изменения дошли **до
-FalkorDB/MCP**, добавь grafit-блок в `post-commit` **ПОСЛЕ** graphify-блока. Он ждёт в
-фоне, пока graphify допишет `graph.json` (mtime > baseline + стабилизация), затем
-`grafit load`. Не блокирует коммит, skip-friendly:
+FalkorDB/MCP**, поставь grafit-блок одной командой (идемпотентно, после graphify-блока,
+с учётом `core.hooksPath`):
 
-```sh
-# --- grafit-hook-start (после graphify-блока) ---
-[ "${GRAFIT_SKIP_HOOK:-0}" = "1" ] && exit 0
-if command -v grafit >/dev/null 2>&1; then
-    _GRAFIT_LOG="${HOME}/.cache/grafit-load.log"
-    mkdir -p "$(dirname "$_GRAFIT_LOG")"
-    _GJ_BASE=$(stat -c %Y graphify-out/graph.json 2>/dev/null || echo 0)
-    echo "[grafit hook] grafit load запланирован после пересборки графа (log: $_GRAFIT_LOG)"
-    nohup env GRAFIT_DIR="$(pwd)" GJ_BASE="$_GJ_BASE" sh -c '
-        cd "$GRAFIT_DIR" || exit 0
-        GJ="graphify-out/graph.json"; prev=""; stable=0; i=0
-        while [ $i -lt 150 ]; do
-            cur=$(stat -c %Y "$GJ" 2>/dev/null || echo 0)
-            if [ "$cur" != "0" ] && [ "$cur" -gt "$GJ_BASE" ]; then
-                if [ "$cur" = "$prev" ]; then stable=$((stable + 1)); else stable=0; fi
-                [ $stable -ge 3 ] && break
-            fi
-            prev="$cur"; i=$((i + 1)); sleep 2
-        done
-        ulimit -v 8000000 2>/dev/null
-        grafit load
-    ' >>"$_GRAFIT_LOG" 2>&1 </dev/null &
-fi
-# --- grafit-hook-end ---
+```bash
+grafit hook install          # в корне проекта; повторный запуск ничего не дублирует
 ```
 
-Как у graphify-хука: при кастомном `core.hooksPath` оставь хук **локальным** через
-`.git/info/exclude` (см. шаг 4a). Проверка: после коммита в `~/.cache/grafit-load.log`
-появится прогон `grafit load`; `grafit query` отдаёт свежие узлы.
+Блок в фоне запускает `grafit refresh --after-hook`: ждёт, пока graphify-хук перепишет
+`graph.json`, и заливает его в FalkorDB. Коммит не ждёт. Дубли гасит сам grafit (flock на
+проект + один отложенный rerun, глобально ≤ `GRAFIT_MAX_LOADS` заливок). Коммит только с
+доками пропускается сразу: граф по коду не устарел. Старые ручные блоки
+(`# grafit-hook-start` … `# grafit-hook-end`, `# --- grafit-hook-start …`, неразмеченный
+`if command -v grafit … fi`) распознаются и заменяются; исходный хук сохраняется в
+`post-commit.grafit-bak`. Пропуск: `GRAFIT_SKIP_HOOK=1`; убрать: `grafit hook uninstall`.
+
+Хук личный: при кастомном `core.hooksPath` внутри репо держи его **локальным** через
+`.git/info/exclude` (см. шаг 4a) — `hook install` подскажет. Проверка: после коммита в
+`~/.cache/grafit-refresh.log` появится прогон; `grafit status` покажет свежий граф.
+
+Пропущенные хуком коммиты (rebase/merge/cherry-pick — graphify-блок выходит раньше) и
+отставшие графы догоняет `grafit refresh` (в проекте) или `grafit refresh --all-stale`
+(все проекты; `--dry-run` — план).
 
 > **Документация (LLM-семантика)** в FalkorDB не обновляется хуком автоматически — как и в
-> части I: `graphify update .` (или `/graphify --update`) → затем `grafit load`.
+> части I: `/graphify --update` → затем `grafit load`.
 
 ## 10. Фиксация версии модели (детерминизм векторов)
 
