@@ -50,11 +50,25 @@ def test_organization_access_checker_bridge(graph):
 # --- длинный backend-flow собирается целиком (compose-fallback) ---
 
 def test_full_backend_flow_composes(graph):
+    # bpm (с 440dd4f-эпохи): AuthController зовёт LoginCommand через mediator — маршрут
+    # controller → action → command ⋯handles→ handler собирается мостом по конвенции
+    r = _route(graph, "AuthController", "LoginCommandHandler")
+    for node in ("AuthController", "LoginCommand", "LoginCommandHandler"):
+        assert node in r, f"в flow нет узла {node}: {r}"
+    assert "handles" in r
+
+
+def test_controller_to_service_via_di_interface(graph):
+    # AuthController получает IJwtTokenService в конструктор — путь до реализации через impl_of
     r = _route(graph, "AuthController", "JwtTokenService")
-    for node in ("AuthController", "LoginCommand", "LoginCommandHandler",
-                 "IJwtTokenService", "JwtTokenService"):
-        assert node in r, f"в составном flow нет узла {node}: {r}"
-    assert "составной путь" in r  # честная маркировка эвристического маршрута
+    assert "IJwtTokenService" in r and "impl_of" in r
+
+
+def test_long_route_marked_as_composite(graph):
+    # длинный эвристический маршрут (controller → … → инфраструктура) честно помечен составным
+    r = _route(graph, "AuthController", "BCryptPasswordHasher")
+    assert "IPasswordHasher" in r
+    assert "составной путь" in r
 
 
 # --- canonical resolution: reference-фрагменты не равноправны определению ---
@@ -95,7 +109,8 @@ def test_file_imports_surface_on_function(graph):
     imps = nav.file_imports(graph, r["sf"], exclude_id=r["id"])
     assert imps, "ожидались file-level imports у компонента"
     targets = {t[2] for t in imps}  # (file_label, rel, target_label, target_sf)
-    assert any("Tokens" in t or "getAccessToken" in t for t in targets)
+    # AuthProvider берёт токены из auth-token-store и обновляет сессию через auth-refresh
+    assert any("token" in t.lower() or "refresh" in t.lower() for t in targets), targets
 
 
 def test_file_imports_excludes_self_for_file_node(graph):
@@ -114,13 +129,18 @@ def test_tests_lookup_finds_handler_tests(graph):
 
 # --- дубликаты: режим similar (node-to-node) ---
 
+# Эталонный дубль: .LoadReadyConfigurationAsync() скопирован в 4 BpmnAssistant*Orchestrator
+# (прежний эталон BuildExportDto устранён в bpm коммитом 440dd4f — общий маппер).
+DUP = "LoadReadyConfigurationAsync"
+
+
 def test_similar_finds_cross_file_duplicate(graph):
-    # .BuildExportDto() продублирован в двух export-хендлерах (PoC-находка, dist≈0.0006)
-    res = dupes.similar(graph, "BuildExportDto", k=6, threshold=0.10)
+    res = dupes.similar(graph, DUP, k=6, threshold=0.10)
     assert res is not None
+    own = res["resolved"]["sf"]
     sfs = {c[3] for c in res["candidates"]}
-    assert any("ExportProcessVersionModel" in s or "ExportCurrentProcessModel" in s for s in sfs), \
-        f"ожидался дубль BuildExportDto в другом export-хендлере, получено: {sfs}"
+    assert any("Orchestrator" in s and s != own for s in sfs), \
+        f"ожидался дубль {DUP} в другом orchestrator-е, получено: {sfs}"
 
 
 def test_similar_excludes_same_file_colocation(graph):
@@ -137,13 +157,13 @@ def test_similar_unknown_symbol_returns_none(graph):
 
 
 def test_similar_drops_reference_fragments(graph):
-    # co-located тип-узлы (Process/ProcessVersion как параметры метода) — usage, не дубли:
-    # фильтр reference-фрагментов должен их убрать, оставив реальный клон метода
-    res = dupes.similar(graph, "BuildExportDto", k=8, threshold=0.10)
+    # usage-узлы (тип упомянут в параметрах/полях) — не дубли: фильтр reference-фрагментов
+    # должен их убрать, оставив реальный клон метода
+    res = dupes.similar(graph, DUP, k=8, threshold=0.10)
     assert res is not None
     labels = {c[1] for c in res["candidates"]}
-    assert ".BuildExportDto()" in labels                 # реальный клон жив
-    assert "Process" not in labels and "ProcessVersion" not in labels
+    assert f".{DUP}()" in labels                          # реальный клон жив
+    assert not dupes.fragment_ids(graph, res["candidates"])
 
 
 # --- дубликаты: глобальный скан ---
@@ -190,7 +210,7 @@ def test_duplicate_pairs_sorted_literal_first(graph):
 
 
 def test_similar_candidates_carry_jaccard(graph):
-    res = dupes.similar(graph, "BuildExportDto", k=6, threshold=0.10)
+    res = dupes.similar(graph, DUP, k=6, threshold=0.10)
     assert res and res["candidates"]
     top = res["candidates"][0]                        # (id,label,ft,sf,loc,text,dist,jaccard)
     assert len(top) == 8
