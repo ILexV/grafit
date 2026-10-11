@@ -177,3 +177,21 @@ def test_hook_tip_warns_when_tracked(tmp_path):
     hook.write_text("#!/bin/sh\n")
     subprocess.run(["git", "-C", str(root), "add", ".githooks/post-commit"], check=True)
     assert "отслеживается" in refresh.hook_tip(root, hook)
+
+
+def test_hook_install_backup_goes_to_dot_git_not_worktree(tmp_path):
+    """core.hooksPath=.githooks: бэкап старого хука — в .git/grafit/, рабочее дерево чистое."""
+    import subprocess
+    root = _repo(tmp_path)
+    subprocess.run(["git", "-C", str(root), "config", "core.hooksPath", ".githooks"], check=True)
+    hook = root / ".githooks" / "post-commit"
+    hook.parent.mkdir()
+    hook.write_text(OLD_MARKED)
+    with open(root / ".git" / "info" / "exclude", "a") as f:
+        f.write(".githooks/post-commit\n")
+    refresh.hook_install(root)
+    assert not list((root / ".githooks").glob("*bak*"))
+    assert (root / ".git" / "grafit" / "post-commit.bak").read_text() == OLD_MARKED
+    st = subprocess.run(["git", "-C", str(root), "status", "--porcelain"],
+                        capture_output=True, text=True, check=True).stdout
+    assert st == ""

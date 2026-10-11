@@ -205,7 +205,7 @@ references/imports вместо «не найдено».
   `grafit refresh --after-hook` ждёт, пока graphify-хук перепишет graph.json, и заливает.
   Старые блоки (`# grafit-hook-start`/`# --- grafit-hook-start …` … `grafit-hook-end`, а также
   неразмеченный `if command -v grafit … fi`) распознаются и заменяются; копия хука —
-  `post-commit.grafit-bak`. `grafit hook uninstall` — убрать. Лог: `~/.cache/grafit-refresh.log`.
+  `.git/grafit/post-commit.bak`. `grafit hook uninstall` — убрать. Лог: `~/.cache/grafit-refresh.log`.
   Пропуск: `GRAFIT_SKIP_HOOK=1`.
 - Конкуренция: на проект — один активный load (flock) + не больше одного отложенного
   догоняющего прохода (rerun); на машину — не больше `GRAFIT_MAX_LOADS` (по умолч. 1)

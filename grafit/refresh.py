@@ -338,6 +338,15 @@ def hook_tip(root: Path, hook: Path) -> str | None:
     return f"  хук внутри репо: держи локальным — `echo {rel} >> .git/info/exclude`"
 
 
+def hook_backup_path(root: Path) -> Path:
+    """Куда класть бэкап хука: всегда внутрь .git (общий git-dir), а не рядом с хуком —
+    хук может жить в рабочем дереве (core.hooksPath=.githooks), и бэкап там пачкал бы git status."""
+    out = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-common-dir"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    gd = Path(out)
+    return (gd if gd.is_absolute() else root / gd) / "grafit" / "post-commit.bak"
+
+
 def hook_install(root: Path, uninstall: bool = False) -> list[str]:
     root = common.project_root(root)
     hd = hooks_dir(root)
@@ -355,8 +364,10 @@ def hook_install(root: Path, uninstall: bool = False) -> list[str]:
             msg.append("  ⚠ graphify-блока нет — graph.json хук не пересоберёт: `graphify hook install`")
     if new != old:
         hd.mkdir(parents=True, exist_ok=True)
-        if old and not (hd / "post-commit.grafit-bak").exists():
-            (hd / "post-commit.grafit-bak").write_text(old, encoding="utf-8")
+        bak = hook_backup_path(root)
+        if old and not bak.exists():
+            bak.parent.mkdir(parents=True, exist_ok=True)
+            bak.write_text(old, encoding="utf-8")
         hook.write_text(new, encoding="utf-8")
         hook.chmod(hook.stat().st_mode | 0o111)
     else:

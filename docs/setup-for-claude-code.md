@@ -306,7 +306,7 @@ grafit hook install          # в корне проекта; повторный 
 доками пропускается сразу: граф по коду не устарел. Старые ручные блоки
 (`# grafit-hook-start` … `# grafit-hook-end`, `# --- grafit-hook-start …`, неразмеченный
 `if command -v grafit … fi`) распознаются и заменяются; исходный хук сохраняется в
-`post-commit.grafit-bak`. Пропуск: `GRAFIT_SKIP_HOOK=1`; убрать: `grafit hook uninstall`.
+`.git/grafit/post-commit.bak`. Пропуск: `GRAFIT_SKIP_HOOK=1`; убрать: `grafit hook uninstall`.
 
 Хук личный: при кастомном `core.hooksPath` внутри репо держи его **локальным** через
 `.git/info/exclude` (см. шаг 4a) — `hook install` подскажет. Проверка: после коммита в
