@@ -253,13 +253,16 @@ def _search_rows(question, project, k, kind):
     return g, name, res
 
 
-def _render_rows(g, name, rows, fr, snippet, neighbors) -> list[str]:
+def _render_rows(g, name, rows, fr, snippet, neighbors, contracts=None) -> list[str]:
     root = _root(name) if snippet else None
     fcache: dict = {}
     out, any_nb = [], False
     for nid, label, ft, sf, loc, clabel, text, dist in rows:
         tag = " [test]" if common.is_test_path(sf) else ""
         out.append(f"\n● {label} ({ft}){tag}  {_score(dist)}\n  {sf}:{loc}{fr.mark(sf)}")
+        if contracts and nid in contracts:
+            clabel_, csf = contracts[nid]
+            out.append(f"  ↳ контракт: {clabel_} ({csf}) — свёрнут сюда, это не дубль")
         if snippet:
             out.extend(_quote(root, sf, loc, fcache, label, sf in fr.changed))
         for d, rel, mlabel, msf in (search.neighbors(g, nid, neighbors) if neighbors else []):
@@ -285,7 +288,7 @@ def grafit_search(question: str, k: int = 8, project: str = "", kind: str = "pro
     if empty:
         return empty
     out = [fr.line, f"[{name}] {question}  (kind={kind} · {_verdict(res)})"]
-    out.extend(_render_rows(g, name, res["rows"], fr, snippet, neighbors))
+    out.extend(_render_rows(g, name, res["rows"], fr, snippet, neighbors, res["contracts"]))
     return "\n".join(out)
 
 
@@ -306,7 +309,8 @@ def grafit_find_existing(description: str, k: int = 6, project: str = "", kind: 
               if q == "strong" else "явного аналога нет, но проверь кандидатов ниже")
     out = [fr.line, f"[{name}] уже есть? «{description}»  (kind={kind} · {_verdict(res)})",
            f"вывод: {advice}"]
-    out.extend(_render_rows(g, name, res["rows"], fr, snippet=True, neighbors=0))
+    out.extend(_render_rows(g, name, res["rows"], fr, snippet=True, neighbors=0,
+                            contracts=res["contracts"]))
     return "\n".join(out)
 
 

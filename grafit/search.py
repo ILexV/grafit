@@ -78,14 +78,17 @@ def search(graph, qvec, question, **kw):
 
 def search_ex(graph, qvec, question, k=8, cand=60, test_penalty=0.5,
               drop_generic=True, reranker=None, hybrid=False, rrf_c=60, lex_weight=0.4,
-              kind="all", dedupe=True, hide_fragments=True, _vcand=None) -> dict:
+              kind="all", dedupe=True, hide_fragments=True, collapse=True, _vcand=None) -> dict:
     """Поиск с фильтром по виду узлов, дедупом и скрытием reference-фрагментов.
 
     Фильтр kind отсёк всё → честно пустой rows (+ filtered_out — сколько кандидатов было
     до фильтра), а НЕ подмена неотфильтрованной выдачей. Дедуп: один узел на sf:loc (graphify
     кладёт file/class/reference-узлы на одну строку). В колонке score — косинусная дистанция
     вектора (None у узла, найденного только лексикой).
-    → {"rows", "filtered_out", "candidates", "best_dist"}"""
+    collapse: файл-узел уступает место самому конкретному узлу того же файла (класс/метод), а из
+    пары интерфейс↔реализация (тип или одноимённый член) остаётся реализация — contracts[id] =
+    (label, sf) свёрнутого контракта.
+    → {"rows", "filtered_out", "candidates", "best_dist", "contracts"}"""
     # при фильтре/дедупе берём больше кандидатов — иначе они «съедят» top-k
     if _vcand:
         vcand = _vcand
@@ -97,7 +100,7 @@ def search_ex(graph, qvec, question, k=8, cand=60, test_penalty=0.5,
         vcand = cand
     vec_rows = graph.query(_VEC_Q, params={"cand": vcand, "q": qvec}).result_set
     lex_rows = _lexical(graph, question, vcand) if hybrid else []
-    empty = {"rows": [], "filtered_out": 0, "candidates": 0, "best_dist": None}
+    empty = {"rows": [], "filtered_out": 0, "candidates": 0, "best_dist": None, "contracts": {}}
     if not vec_rows and not lex_rows:
         return empty
 
@@ -130,13 +133,17 @@ def search_ex(graph, qvec, question, k=8, cand=60, test_penalty=0.5,
 
     if hide_fragments or dedupe:
         order = _prune(graph, order, by_id, k * 4, dedupe, hide_fragments)
+    contracts: dict = {}
+    if collapse:
+        order = _collapse_files(order, by_id)
+        order, contracts = _collapse_contracts(graph, order[:k * 2], by_id)
 
     if len(order) < k and widen:
         # фильтр съел почти весь пул — один повторный проход с пулом вчетверо шире
         return search_ex(graph, qvec, question, k=k, cand=cand, test_penalty=test_penalty,
                          drop_generic=drop_generic, reranker=reranker, hybrid=hybrid, rrf_c=rrf_c,
                          lex_weight=lex_weight, kind=kind, dedupe=dedupe,
-                         hide_fragments=hide_fragments, _vcand=vcand * 4)
+                         hide_fragments=hide_fragments, collapse=collapse, _vcand=vcand * 4)
     if reranker is not None and order:
         pool = order[:max(k * 4, 30)]
         scores = list(reranker.rerank(question, [(by_id[nid][6] or by_id[nid][1]) for nid in pool]))
@@ -150,14 +157,76 @@ def search_ex(graph, qvec, question, k=8, cand=60, test_penalty=0.5,
     rows = [tuple(by_id[nid][:7]) + (vdist.get(nid),) for nid in order[:k]]
     dists = [d for d in (vdist.get(nid) for nid in order) if d is not None]
     return {"rows": rows, "filtered_out": len(by_id) - len(idset), "candidates": len(by_id),
-            "best_dist": min(dists) if dists else None}
+            "best_dist": min(dists) if dists else None,
+            "contracts": {nid: c for nid, c in contracts.items() if nid in set(order[:k])}}
+
+
+def _is_file_node(r) -> bool:
+    sf = r[3] or ""
+    return bool(sf) and r[1] == sf.rsplit("/", 1)[-1]
+
+
+def _collapse_files(order, by_id):
+    """Файл-узел (label = имя файла) и узел из того же файла — один результат: на место файла
+    встаёт первый (самый релевантный) конкретный узел этого файла. Файл без пары — остаётся."""
+    out, used = [], set()
+    for i, nid in enumerate(order):
+        if nid in used:
+            continue
+        r = by_id[nid]
+        if _is_file_node(r):
+            twin = next((x for x in order[i + 1:] if x not in used
+                         and by_id[x][3] == r[3] and not _is_file_node(by_id[x])), None)
+            if twin:
+                used.add(twin)
+                nid = twin
+        used.add(nid)
+        out.append(nid)
+    return out
+
+
+def _collapse_contracts(graph, order, by_id):
+    """Интерфейс/база и реализация в одной выдаче — один результат: остаётся реализация (код,
+    который делает работу) на месте лучшего из двух; контракт — пометкой. Типы — по рёбрам
+    implements/inherits или конвенции IFoo↔Foo, члены — одноимённые с родственными владельцами."""
+    from . import dupes
+    if len(order) < 2:
+        return order, {}
+    own = dupes.owners(graph, order)
+    typ = {nid: (own[nid] if nid in own else by_id[nid][1]) for nid in order
+           if nid in own or (by_id[nid][2] == "code" and not by_id[nid][1].endswith(")")
+                             and not _is_file_node(by_id[nid]))}
+    if len(typ) < 2:
+        return order, {}
+    sup = dupes.supertypes(graph, list(typ.values()))
+
+    def contract_of(a, b):          # b — контракт a? (a реализует/наследует b)
+        ta, tb = dupes.type_name(typ[a]), dupes.type_name(typ[b])
+        return tb in sup.get(ta, ()) or tb == "i" + ta
+
+    def same_member(a, b):
+        if (a in own) != (b in own):
+            return False
+        return a not in own or dupes.member_name(by_id[a][1]) == dupes.member_name(by_id[b][1])
+
+    drop, notes, pos = set(), {}, {nid: i for i, nid in enumerate(order)}
+    for a in typ:
+        for b in typ:
+            if a == b or a in drop or b in drop or not same_member(a, b):
+                continue
+            if contract_of(a, b):
+                drop.add(b)
+                notes[a] = (by_id[b][1], by_id[b][3])
+                pos[a] = min(pos[a], pos[b])
+    kept = sorted((nid for nid in order if nid not in drop), key=lambda n: pos[n])
+    return kept, notes
 
 
 def _prune(graph, order, by_id, need, dedupe, hide_fragments):
     """Оставить по одному узлу на sf:loc и выкинуть reference-фрагменты/стабы (символ упомянут
     в чужом файле, но определён не тут) — их цитата ведёт не туда. Набирает до need узлов."""
     from . import nav
-    out, seen = [], set()
+    out, seen = [], {}
     pos = 0
     while pos < len(order) and len(out) < need:
         chunk = order[pos:pos + max(need * 2, 20)]
@@ -165,12 +234,15 @@ def _prune(graph, order, by_id, need, dedupe, hide_fragments):
         relmap = nav._rel_map(graph, chunk) if hide_fragments else {}
         for nid in chunk:
             r = by_id[nid]
-            key = (r[3], r[4])
-            if dedupe and r[3] and r[4] and key in seen:
-                continue
             if hide_fragments and nav._is_fragment((nid, r[1], r[2], r[3], r[4]), relmap):
                 continue
-            seen.add(key)
+            key = (r[3], r[4])
+            if dedupe and r[3] and r[4] and key in seen:
+                i = seen[key]          # на одной строке файл-узел уступает конкретному узлу
+                if _is_file_node(by_id[out[i]]) and not _is_file_node(r):
+                    out[i] = nid
+                continue
+            seen[key] = len(out)
             out.append(nid)
     return out
 

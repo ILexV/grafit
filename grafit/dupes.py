@@ -106,6 +106,86 @@ def is_family_pair(a_label: str | None, b_label: str | None) -> bool:
     return any(long == short + suf for suf in _FAMILY_SUFFIXES)
 
 
+def member_name(label: str | None) -> str:
+    """Имя члена без точки/скобок/generic и без квалификатора явной реализации интерфейса:
+    '.CalculateAsync()' / 'IFoo.CalculateAsync' / 'Get<T>()' → 'calculateasync' / 'get'."""
+    b = re.sub(r"<[^<>]*>", "", nav._bare(label or ""))
+    return b.rsplit(".", 1)[-1].lower()
+
+
+def type_name(label: str | None) -> str:
+    """Имя типа для сравнения: без generic-параметров, namespace и регистра."""
+    b = re.sub(r"<.*", "", nav._bare(label or ""))
+    return b.rsplit(".", 1)[-1].lower()
+
+
+def types_related(a: str, b: str, supers: dict) -> bool:
+    """Типы a и b — контракт и его реализация/наследник: ребро implements/inherits (по имени —
+    graphify вешает его на узел-заглушку интерфейса) или конвенция IFoo ↔ Foo."""
+    a, b = type_name(a), type_name(b)
+    if not a or not b or a == b:
+        return False
+    if b in supers.get(a, ()) or a in supers.get(b, ()):
+        return True
+    return a == "i" + b or b == "i" + a
+
+
+def owners(graph, ids: list[str]) -> dict:
+    """id члена → имя его типа-владельца (ребро method: класс → метод). Один запрос на пачку."""
+    if not ids:
+        return {}
+    rs = graph.query("MATCH (c:Entity)-[r:LINK]->(m:Entity) WHERE m.id IN $ids AND "
+                     "r.relation = 'method' RETURN m.id, c.label", params={"ids": ids}).result_set
+    return {mid: clabel for mid, clabel in rs}
+
+
+def file_types(graph, sf: str) -> list[str]:
+    """Имена типов, объявленных в файле (владельцы методов) — для символа из рабочего дерева."""
+    rs = graph.query("MATCH (c:Entity)-[r:LINK]->(m:Entity) WHERE m.source_file = $sf AND "
+                     "r.relation = 'method' RETURN DISTINCT c.label", params={"sf": sf}).result_set
+    return [r[0] for r in rs]
+
+
+def supertypes(graph, type_labels) -> dict:
+    """имя типа → множество имён его интерфейсов/баз (implements/inherits, один уровень)."""
+    labels = sorted({t for t in type_labels if t})
+    if not labels:
+        return {}
+    rs = graph.query("MATCH (a:Entity)-[r:LINK]->(t:Entity) WHERE a.label IN $ls AND "
+                     "r.relation IN ['implements', 'inherits'] RETURN a.label, t.label",
+                     params={"ls": labels}).result_set
+    out: dict = {}
+    for a, t in rs:
+        out.setdefault(type_name(a), set()).add(type_name(t))
+    return out
+
+
+def contract_ids(graph, anchor_label: str, anchor_types: list[str], rows,
+                 anchor_is_type: bool = False) -> set:
+    """id кандидатов, которые с anchor — один контракт, а не дубль. rows — кортежи (id, label, …).
+
+    Член (метод): то же имя, а владельцы — интерфейс↔реализация или база↔override (вкл. явную
+    реализацию IFoo.Bar). Тип (класс): его интерфейс/база/наследник и их члены."""
+    if not anchor_types:
+        return set()
+    name = member_name(anchor_label)
+    if anchor_is_type:
+        pool = list(rows)
+    else:
+        pool = [r for r in rows if name and member_name(r[1]) == name]
+    if not pool:
+        return set()
+    own = owners(graph, [r[0] for r in pool])
+    sup = supertypes(graph, list(anchor_types) + list(own.values())
+                     + ([r[1] for r in pool] if anchor_is_type else []))
+    out = set()
+    for r in pool:
+        rel_to = [own[r[0]]] if r[0] in own else ([r[1]] if anchor_is_type else [])
+        if any(types_related(t, x, sup) for t in anchor_types for x in rel_to):
+            out.add(r[0])
+    return out
+
+
 def pair_key(a_id: str, b_id: str) -> tuple[str, str]:
     """Ненаправленный ключ пары (для дедупа A↔B == B↔A)."""
     return (a_id, b_id) if a_id <= b_id else (b_id, a_id)
@@ -219,7 +299,11 @@ def similar(graph, symbol: str, k: int = 6, threshold: float = 0.10,
     if qvec is None:
         return {"resolved": r, "candidates": []}
     linked = _linked_ids(graph, r["id"])
-    out = _filter_near(graph, qvec, r["id"], r["label"], r["sf"], linked, k, threshold, kind)
+    own = list(owners(graph, [r["id"]]).values())
+    is_type = not own and not r["label"].endswith(")") and r["ft"] == "code"
+    atypes = [r["label"]] if is_type else (own or file_types(graph, r["sf"]))
+    out = _filter_near(graph, qvec, r["id"], r["label"], r["sf"], linked, k, threshold, kind,
+                       anchor_types=atypes, anchor_is_type=is_type)
     if reranker is not None and out:
         out = _rerank_pairs(reranker, node_text(graph, r["id"]) or r["label"], out)
     out = out[:k]
@@ -229,14 +313,17 @@ def similar(graph, symbol: str, k: int = 6, threshold: float = 0.10,
     return {"resolved": r, "candidates": out}
 
 
-def _filter_near(graph, qvec, self_id, self_label, self_sf, linked, k, threshold, kind):
+def _filter_near(graph, qvec, self_id, self_label, self_sf, linked, k, threshold, kind,
+                 anchor_types=None, anchor_is_type=False):
     """Ближайшие по вектору узлы минус шум: self, прямые связи, usage-фрагменты, generic/
     framework-методы, тот же файл (co-location ≠ клон), пары-семьи, чужой kind, dist>threshold."""
     rows = nearest(graph, qvec, max(k * 8, 40))
     frag = fragment_ids(graph, rows)               # usage-узлы типа/символа — не дубли
+    # метод интерфейса ↔ его реализация, база ↔ override — один контракт, не копипаст
+    contract = contract_ids(graph, self_label, anchor_types or [], rows, anchor_is_type)
     out = []
     for nid, label, ft, sf, loc, text, dist in rows:
-        if nid == self_id or nid in linked or nid in frag:
+        if nid == self_id or nid in linked or nid in frag or nid in contract:
             continue
         if is_noise_label(label) or not is_symbol_node(label, sf):
             continue
@@ -277,7 +364,11 @@ def similar_to_text(graph, qvec, anchor: dict, k: int = 6, threshold: float = 0.
                     kind: str = "all", reranker=None) -> list:
     """Near-duplicate узлы графа для кода ВНЕ графа (anchor = worktree_text): кандидаты
     [(id,label,ft,sf,loc,text,dist,jaccard)]. Тот же отсев шума, что у similar()."""
-    out = _filter_near(graph, qvec, None, anchor["label"], anchor["sf"], set(), k, threshold, kind)
+    ftypes = file_types(graph, anchor["sf"])
+    is_type = type_name(anchor["label"]) in {type_name(t) for t in ftypes}
+    out = _filter_near(graph, qvec, None, anchor["label"], anchor["sf"], set(), k, threshold, kind,
+                       anchor_types=[anchor["label"]] if is_type else ftypes,
+                       anchor_is_type=is_type)
     if reranker is not None and out:
         out = _rerank_pairs(reranker, anchor["text"], out)
     ash = shingles(anchor["text"])

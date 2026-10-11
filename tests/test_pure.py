@@ -255,3 +255,27 @@ def test_cluster_pairs_transitive_merge():
 
 def test_cluster_pairs_empty():
     assert dupes.cluster_pairs([]) == []
+
+
+# --- dupes: контракт (интерфейс↔реализация, база↔override) — не дубль ---
+
+def test_member_name_strips_explicit_interface_and_generics():
+    assert dupes.member_name(".CalculateAsync()") == "calculateasync"
+    assert dupes.member_name("IEnumerable.GetEnumerator()") == "getenumerator"
+    assert dupes.member_name(".Get<T>()") == "get"
+
+
+def test_types_related():
+    assert dupes.types_related("NormService", "INormService", {})          # конвенция
+    assert dupes.types_related("INormService", "NormService", {})
+    assert dupes.types_related("UserRepo", "BaseRepo", {"userrepo": {"baserepo"}})
+    assert not dupes.types_related("Alpha", "Beta", {})
+    assert not dupes.types_related("Same", "Same", {})
+
+
+def test_contract_ids_member_and_type():
+    from tests.fakes import FakeGraph
+    rows = [("im", ".Calc()"), ("x", ".Calc()"), ("it", "INormService")]
+    g = FakeGraph([], owners={"im": "INormService", "x": "Unrelated"})
+    assert dupes.contract_ids(g, ".Calc()", ["NormService"], rows) == {"im"}
+    assert dupes.contract_ids(g, "NormService", ["NormService"], rows, anchor_is_type=True) == {"im", "it"}

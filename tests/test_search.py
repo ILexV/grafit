@@ -31,8 +31,8 @@ def test_dedupe_by_source_location():
              ("c1", "Branch", "code", CODE, "L1", 0.15),
              ("m1", ".Grant()", "code", CODE, "L20", 0.16)]
     rows = _run(nodes, k=5)["rows"]
-    assert [r[0] for r in rows] == ["f1", "m1"]
-    assert _run(nodes, k=5, dedupe=False)["rows"].__len__() == 3
+    assert [r[0] for r in rows] == ["c1", "m1"]          # класс вместо файла на той же строке
+    assert len(_run(nodes, k=5, dedupe=False, collapse=False)["rows"]) == 3
 
 
 def test_reference_fragments_hidden():
@@ -72,3 +72,55 @@ def test_filtered_search_widens_pool_once_when_filter_eats_it():
 def test_empty_graph():
     res = _run([])
     assert res["rows"] == [] and res["candidates"] == 0
+
+
+# --- сворачивание: файл-узел ↔ класс, интерфейс ↔ реализация ---
+
+IFACE = "backend/App/INormService.cs"
+IMPL = "backend/Infra/NormService.cs"
+
+
+def test_file_node_collapses_into_class_from_same_file():
+    nodes = [("f", "Branch.cs", "code", CODE, "L1", 0.14),
+             ("x", "Other", "code", "src/x.cs", "L3", 0.15),
+             ("c", "Branch", "code", CODE, "L5", 0.16)]
+    rows = _run(nodes, k=5)["rows"]
+    assert [r[0] for r in rows] == ["c", "x"]          # класс встал на место файла
+    assert [r[0] for r in _run(nodes, k=5, collapse=False)["rows"]] == ["f", "x", "c"]
+
+
+def test_lonely_file_node_kept():
+    nodes = [("f", "Branch.cs", "code", CODE, "L1", 0.14)]
+    assert [r[0] for r in _run(nodes)["rows"]] == ["f"]
+
+
+def test_interface_and_implementation_collapse_to_implementation():
+    nodes = [("it", "INormService", "code", IFACE, "L5", 0.14),
+             ("im", ".Calc()", "code", IFACE, "L9", 0.145),
+             ("ct", "NormService", "code", IMPL, "L7", 0.15),
+             ("cm", ".Calc()", "code", IMPL, "L12", 0.155),
+             ("o", ".Other()", "code", "src/o.cs", "L1", 0.16)]
+    g = FakeGraph(nodes, owners={"im": "INormService", "cm": "NormService", "o": "Other"},
+                  supers={"NormService": ["INormService"]})
+    res = search.search_ex(g, [0.0], "q", k=5)
+    assert [r[0] for r in res["rows"]] == ["ct", "cm", "o"]
+    assert res["contracts"]["ct"][0] == "INormService" and res["contracts"]["cm"][1] == IFACE
+
+
+def test_convention_and_override_without_edges():
+    # без implements-ребра: конвенция IFoo↔Foo; override — база по ребру inherits
+    nodes = [("a", ".Run()", "code", "src/IJob.cs", "L3", 0.14),
+             ("b", ".Run()", "code", "src/Job.cs", "L4", 0.15),
+             ("c", ".Save()", "code", "src/Base.cs", "L3", 0.16),
+             ("d", ".Save()", "code", "src/Derived.cs", "L3", 0.17)]
+    g = FakeGraph(nodes, owners={"a": "IJob", "b": "Job", "c": "BaseRepo", "d": "UserRepo"},
+                  supers={"UserRepo": ["BaseRepo<User>"]})
+    res = search.search_ex(g, [0.0], "q", k=5)
+    assert [r[0] for r in res["rows"]] == ["b", "d"]
+
+
+def test_same_named_methods_of_unrelated_types_not_collapsed():
+    nodes = [("a", ".Run()", "code", "src/A.cs", "L3", 0.14),
+             ("b", ".Run()", "code", "src/B.cs", "L4", 0.15)]
+    g = FakeGraph(nodes, owners={"a": "Alpha", "b": "Beta"})
+    assert len(search.search_ex(g, [0.0], "q", k=5)["rows"]) == 2

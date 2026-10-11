@@ -11,9 +11,11 @@ class _RS:
 
 
 class FakeGraph:
-    def __init__(self, nodes, rels=None):
+    def __init__(self, nodes, rels=None, owners=None, supers=None):
         self.nodes = sorted(nodes, key=lambda n: n[5])
         self.rels = rels or {}          # id -> set(relation)
+        self.owners = owners or {}      # id члена -> имя типа-владельца (ребро method)
+        self.supers = supers or {}      # имя типа -> [имена интерфейсов/баз]
         self.vec_calls = []
 
     def query(self, q, params=None):
@@ -27,6 +29,10 @@ class FakeGraph:
             return _RS([])
         if "collect(DISTINCT r.relation)" in q:
             return _RS([(i, list(self.rels[i])) for i in params["ids"] if i in self.rels])
+        if "r.relation = 'method' RETURN m.id, c.label" in q:
+            return _RS([(i, self.owners[i]) for i in params["ids"] if i in self.owners])
+        if "r.relation IN ['implements', 'inherits']" in q:
+            return _RS([(a, t) for a in params["ls"] for t in self.supers.get(a, [])])
         if "RETURN DISTINCT r.relation" in q:      # neighbors
             return _RS([])
         raise AssertionError(f"неожиданный запрос: {q}")
