@@ -96,3 +96,47 @@ def test_load_slots(tmp_path, monkeypatch):
         assert not common.acquire_load_lock(wait=False)
     finally:
         held.close()
+
+
+# --- фоновый refresh при старте MCP ---
+
+@pytest.fixture
+def meta_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(common, "HOME", tmp_path)
+    monkeypatch.setattr(common, "META_PATH", tmp_path / "meta.json")
+    monkeypatch.setattr(common, "project_root", lambda *a: tmp_path / "proj")
+    monkeypatch.setattr(refresh.Path, "home", staticmethod(lambda: tmp_path))
+    calls = []
+    monkeypatch.setattr(refresh.subprocess, "Popen", lambda cmd, **kw: calls.append((cmd, kw)) or "proc")
+    (tmp_path / "proj").mkdir()
+    return tmp_path, calls
+
+
+def test_spawn_background_only_for_known_project_and_debounced(meta_home, monkeypatch):
+    tmp, calls = meta_home
+    assert refresh.spawn_background() is None and not calls     # проекта нет в meta.json
+    common.save_meta("proj", commit="abc", root=str(tmp / "proj"))
+    assert refresh.spawn_background() == "proc"
+    cmd, kw = calls[0]
+    assert cmd[-2:] == ["refresh", str(tmp / "proj")] and kw["start_new_session"]
+    assert refresh.spawn_background() is None and len(calls) == 1   # debounce
+    assert refresh.spawn_background(debounce=0) == "proc"
+
+
+def test_spawn_background_disabled_by_env(meta_home, monkeypatch):
+    tmp, calls = meta_home
+    common.save_meta("proj", commit="abc", root=str(tmp / "proj"))
+    monkeypatch.setenv("GRAFIT_MCP_REFRESH", "0")
+    assert refresh.spawn_background() is None and not calls
+
+
+def test_refresh_takes_project_lock_before_graphify(tmp_path, monkeypatch):
+    monkeypatch.setattr(common, "HOME", tmp_path)
+    monkeypatch.setattr(common, "project_root", lambda *a: tmp_path)
+    monkeypatch.setattr(refresh, "plan", lambda *a, **k: {
+        "stale": True, "why": "код", "graphify": True, "force": False})
+    monkeypatch.setattr(common, "become_active_loader", lambda name: False)
+    ran = []
+    monkeypatch.setattr(refresh, "graphify_update", lambda *a, **k: ran.append(1))
+    out = refresh.refresh_project(tmp_path)
+    assert "уже идёт" in out and not ran and common.rerun_pending(common.graph_name(None, tmp_path))

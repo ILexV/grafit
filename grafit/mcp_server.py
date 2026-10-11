@@ -8,7 +8,8 @@ grafit_status, grafit_find_existing, grafit_similar, grafit_dupes
 
 Конфиг: GRAFIT_HOST / GRAFIT_PORT (по умолч. localhost:6399), GRAFIT_THREADS (4),
 GRAFIT_TOOLS = all (по умолч.) | core (без редких) | список имён через запятую
-(search,impact,…), GRAFIT_USAGE_LOG=0 — выключить журнал ~/.grafit/usage.jsonl.
+(search,impact,…), GRAFIT_USAGE_LOG=0 — выключить журнал ~/.grafit/usage.jsonl,
+GRAFIT_MCP_REFRESH=0 — не запускать фоновый `grafit refresh` своего проекта при старте.
 """
 from __future__ import annotations
 import contextvars, functools, json, os, re, time
@@ -482,6 +483,10 @@ def grafit_list_projects() -> str:
 
 
 def main():
+    # Догнать отставший граф своего проекта в фоне: не блокирует старт и ответы (граф
+    # подменяется атомарно), очередь — через flock проекта и семафор заливок.
+    from . import refresh
+    refresh.spawn_background()
     mcp.run()
 
 

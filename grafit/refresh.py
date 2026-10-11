@@ -19,12 +19,12 @@ def _stamp() -> str:
 
 # --- заливка с coalescing (общая для `grafit load` и refresh) ---
 
-def load_coalesced(name: str, **index_kw) -> bool:
+def load_coalesced(name: str, already_active: bool = False, **index_kw) -> bool:
     """`grafit load` с «ровно одним отложенным проходом на проект»: если заливка этого графа
     уже идёт — не плодим второй процесс и не убиваем активный, лишь помечаем rerun (False).
     Активный загрузчик после своего прохода видит пометку и делает ОДИН догоняющий проход."""
     from . import index
-    if not common.become_active_loader(name):
+    if not already_active and not common.become_active_loader(name):
         common.request_rerun(name)
         log(f"[grafit] заливка '{name}' уже идёт — отложен один повторный проход (rerun)")
         return False
@@ -157,12 +157,53 @@ def refresh_project(root: Path, *, min_commits: int = 1, after_hook: bool = Fals
             base = time.time() - 5
         if not wait_graph_rebuild(gj, base, wait_timeout):
             log(f"[grafit refresh] {name}: graph.json не пересобран за {int(wait_timeout)}s — заливаю как есть")
-    elif p["graphify"] and not skip_graphify:
-        graphify_update(root, force=p["force"])
     kw = {"project": str(root), "host": "localhost", "port": 6399}
     kw.update(index_kw or {})
-    done = load_coalesced(name, **kw)
+    if after_hook or not p["graphify"] or skip_graphify:
+        done = load_coalesced(name, **kw)
+    else:
+        # graphify update — под тем же замком проекта, что и load: два refresh одного проекта
+        # (несколько чатов стартовали MCP) не пишут graph.json одновременно
+        if not common.become_active_loader(name):
+            common.request_rerun(name)
+            return f"{name}: обновление уже идёт — поставлен rerun ({p['why']})"
+        graphify_update(root, force=p["force"])
+        done = load_coalesced(name, already_active=True, **kw)
     return f"{name}: {'залит' if done else 'заливка уже идёт — поставлен rerun'} ({p['why']})"
+
+
+# --- фоновый refresh при старте MCP-сервера ---
+
+DEBOUNCE_S = 600
+
+
+def spawn_background(root=None, debounce: float = DEBOUNCE_S):
+    """Запустить `grafit refresh <проект>` отдельным процессом и не ждать (старт `grafit mcp`).
+
+    Только для проекта, уже залитого в grafit (есть в meta.json): незнакомый каталог не
+    индексируем. Не чаще раза в debounce секунд на проект — несколько чатов, открытых разом,
+    не плодят процессы. Отключение: GRAFIT_MCP_REFRESH=0. → Popen или None."""
+    if os.environ.get("GRAFIT_MCP_REFRESH", "1") == "0":
+        return None
+    try:
+        root = common.project_root(root)
+        name = common.graph_name(None, root)
+        if name not in common.load_meta():
+            return None
+        stamp = common.HOME / f"refresh.{common.sanitize(name)}.stamp"
+        if stamp.exists() and time.time() - stamp.stat().st_mtime < debounce:
+            return None
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+        logp = Path.home() / ".cache" / "grafit-refresh.log"
+        logp.parent.mkdir(parents=True, exist_ok=True)
+        out = open(logp, "a", encoding="utf-8")
+        cmd = [sys.executable, "-m", "grafit.cli", "refresh", str(root)]
+        return subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                cwd=str(root), start_new_session=True, close_fds=True)
+    except Exception as ex:          # фон — best effort: MCP-сервер должен стартовать всегда
+        log(f"[grafit mcp] фоновый refresh не запущен: {ex!r}")
+        return None
 
 
 def refresh_all_stale(min_commits: int = 1, dry_run: bool = False, index_kw: dict | None = None):
