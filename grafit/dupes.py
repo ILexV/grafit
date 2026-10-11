@@ -219,17 +219,30 @@ def similar(graph, symbol: str, k: int = 6, threshold: float = 0.10,
     if qvec is None:
         return {"resolved": r, "candidates": []}
     linked = _linked_ids(graph, r["id"])
+    out = _filter_near(graph, qvec, r["id"], r["label"], r["sf"], linked, k, threshold, kind)
+    if reranker is not None and out:
+        out = _rerank_pairs(reranker, node_text(graph, r["id"]) or r["label"], out)
+    out = out[:k]
+    # Второй сигнал: Jaccard шинглов anchor↔кандидат — копипаст (высокий) vs семантика (низкий)
+    ash = shingles(node_text(graph, r["id"]))
+    out = [(*row, jaccard(ash, shingles(row[5]))) for row in out]
+    return {"resolved": r, "candidates": out}
+
+
+def _filter_near(graph, qvec, self_id, self_label, self_sf, linked, k, threshold, kind):
+    """Ближайшие по вектору узлы минус шум: self, прямые связи, usage-фрагменты, generic/
+    framework-методы, тот же файл (co-location ≠ клон), пары-семьи, чужой kind, dist>threshold."""
     rows = nearest(graph, qvec, max(k * 8, 40))
     frag = fragment_ids(graph, rows)               # usage-узлы типа/символа — не дубли
     out = []
     for nid, label, ft, sf, loc, text, dist in rows:
-        if nid == r["id"] or nid in linked or nid in frag:
+        if nid == self_id or nid in linked or nid in frag:
             continue
         if is_noise_label(label) or not is_symbol_node(label, sf):
             continue
-        if sf and sf == r["sf"]:                    # co-location в одном файле — не клон
+        if sf and sf == self_sf:                    # co-location в одном файле — не клон
             continue
-        if is_family_pair(r["label"], label):       # XCommand↔XCommandHandler — связь, не дубль
+        if is_family_pair(self_label, label):       # XCommand↔XCommandHandler — связь, не дубль
             continue
         if not common.kind_matches(sf, ft, kind):
             continue
@@ -239,13 +252,36 @@ def similar(graph, symbol: str, k: int = 6, threshold: float = 0.10,
         if len(out) >= k * 3:
             break
     out.sort(key=lambda x: x[6])
+    return out
+
+
+def worktree_text(root, sf: str, symbol: str, cache=None) -> dict | None:
+    """Текст символа из ТЕКУЩЕЙ версии файла (рабочее дерево) в том же формате, что узел
+    при индексации, — для проверки «не дублирует ли только что написанный код старый», даже
+    если символа ещё нет в графе. None — файла/символа нет."""
+    cache = {} if cache is None else cache
+    lines = common._file_lines(root, sf, cache)
+    if not lines:
+        return None
+    bare = nav._bare(symbol)
+    rx = re.compile(rf"(?<![\w$]){re.escape(bare)}(?![\w$])")
+    line = next((i for i, ln in enumerate(lines, 1) if rx.search(ln)), None)
+    if line is None:
+        return None
+    node = {"label": symbol, "source_file": sf, "source_location": f"L{line}", "file_type": "code"}
+    return {"label": symbol, "sf": sf, "loc": f"L{line}",
+            "text": common.node_texts(node, {}, root=root, cache=cache)[1]}
+
+
+def similar_to_text(graph, qvec, anchor: dict, k: int = 6, threshold: float = 0.10,
+                    kind: str = "all", reranker=None) -> list:
+    """Near-duplicate узлы графа для кода ВНЕ графа (anchor = worktree_text): кандидаты
+    [(id,label,ft,sf,loc,text,dist,jaccard)]. Тот же отсев шума, что у similar()."""
+    out = _filter_near(graph, qvec, None, anchor["label"], anchor["sf"], set(), k, threshold, kind)
     if reranker is not None and out:
-        out = _rerank_pairs(reranker, node_text(graph, r["id"]) or r["label"], out)
-    out = out[:k]
-    # Второй сигнал: Jaccard шинглов anchor↔кандидат — копипаст (высокий) vs семантика (низкий)
-    ash = shingles(node_text(graph, r["id"]))
-    out = [(*row, jaccard(ash, shingles(row[5]))) for row in out]
-    return {"resolved": r, "candidates": out}
+        out = _rerank_pairs(reranker, anchor["text"], out)
+    ash = shingles(anchor["text"])
+    return [(*row, jaccard(ash, shingles(row[5]))) for row in out[:k]]
 
 
 def _rerank_pairs(reranker, anchor_text, rows):
@@ -419,6 +455,23 @@ def format_similar(graph, name: str, symbol: str, k: int = 6, threshold: float =
     out = [f"[{name}] дубли ~ {r['label']} ({r['ft']}, {r['sf']}:{r['loc']})  "
            f"порог dist≤{threshold}"]
     cands = res["candidates"]
+    if not cands:
+        out.append("  похожих узлов в пределах порога нет (это хорошо — дублей не видно)")
+        return out
+    cache: dict = {}
+    for nid, label, ft, sf, loc, text, dist, jacc in cands:
+        out.append(f"\n  ≈{dist:.4f}  [{_tag(jacc >= LITERAL_JACCARD, jacc)}]  {label} ({ft})"
+                   f"\n          {sf}:{loc}")
+        out.extend(_snip(root, sf, loc, cache))
+    return out
+
+
+def format_similar_text(graph, name: str, anchor: dict, qvec, k: int = 6, threshold: float = 0.10,
+                        kind: str = "all", reranker=None, root=None) -> list[str]:
+    cands = similar_to_text(graph, qvec, anchor, k=k, threshold=threshold, kind=kind,
+                            reranker=reranker)
+    out = [f"[{name}] дубли ~ {anchor['label']} (рабочее дерево: {anchor['sf']}:{anchor['loc']})  "
+           f"порог dist≤{threshold}"]
     if not cands:
         out.append("  похожих узлов в пределах порога нет (это хорошо — дублей не видно)")
         return out

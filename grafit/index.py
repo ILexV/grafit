@@ -20,7 +20,7 @@ def ensure_graph_json(project: Path, build: bool) -> Path:
     if gj.exists():
         return gj
     if build and _have_graphify():
-        print("graph.json нет — строю через graphify ...")
+        common.log("graph.json нет — строю через graphify ...")
         subprocess.run(["graphify", "."], cwd=str(project), check=True)
         if gj.exists():
             return gj
@@ -41,7 +41,7 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
     gsha = common.file_sha(gj)
     if not no_cache and not build and not force \
             and (common.load_meta().get(name) or {}).get("graph_sha") == gsha:
-        print(f"✓ граф '{name}': graph.json не изменился с прошлой заливки — пропуск (--force чтобы перезалить).")
+        common.log(f"✓ граф '{name}': graph.json не изменился с прошлой заливки — пропуск (--force чтобы перезалить).")
         return {"graph": name, "skipped": True, "graph_sha": gsha}
 
     # Глобальный замок: сериализует заливки РАЗНЫХ проектов (post-commit-хуки бьют одновременно),
@@ -53,7 +53,7 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
     links = g.get("links") or g.get("edges") or []
     labels_p = root / "graphify-out" / ".graphify_labels.json"
     comm_labels = json.loads(labels_p.read_text(encoding="utf-8")) if labels_p.exists() else {}
-    print(f"проект: {root}\nграф FalkorDB: '{name}'  ({len(nodes)} узлов, {len(links)} рёбер)")
+    common.log(f"проект: {root}\nграф FalkorDB: '{name}'  ({len(nodes)} узлов, {len(links)} рёбер)")
 
     common.register(name, root)
 
@@ -66,19 +66,19 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
     else:
         model_name, switching = common.pick_model(), False
     is_e5 = "e5" in model_name.lower()
-    print(f"модель эмбеддингов: {model_name}{' (e5)' if is_e5 else ''}")
+    common.log(f"модель эмбеддингов: {model_name}{' (e5)' if is_e5 else ''}")
     if switching:
-        print(f"⚠ смена модели (было {cfg['model']}) — ОСТАЛЬНЫЕ проекты надо перезалить!")
+        common.log(f"⚠ смена модели (было {cfg['model']}) — ОСТАЛЬНЫЕ проекты надо перезалить!")
 
     fcache: dict = {}
     # clean_texts хранится как свойство узла `text` (full-text индекс/выдача) — с меткой
     # сообщества, поведение поиска без изменений. Текст для ЭМБЕДДИНГА/кэша считаем отдельно
     # БЕЗ метки сообщества: graphify регенерирует её при каждой пересборке (недетерминированная
     # кластеризация), иначе ключ кэша «плавал» бы у всех узлов и кэш промахивался целиком.
-    clean_texts = [common.node_text(n, comm_labels, root=root, cache=fcache,
-                                    snippets=not no_snippets) for n in nodes]
-    embed_base = [common.node_text(n, comm_labels, root=root, cache=fcache,
-                                   snippets=not no_snippets, include_community=False) for n in nodes]
+    pairs = [common.node_texts(n, comm_labels, root=root, cache=fcache, snippets=not no_snippets)
+             for n in nodes]
+    clean_texts = [p[0] for p in pairs]
+    embed_base = [p[1] for p in pairs]
     embed_texts = ["passage: " + t for t in embed_base] if is_e5 else embed_base
 
     # кэш эмбеддингов в Redis/FalkorDB: чтение пропускаем при смене модели / --no-cache,
@@ -91,7 +91,7 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
         if h not in emb_cache and h not in missing:
             missing[h] = t
     reused = sum(1 for h in hashes if h in emb_cache)
-    print(f"эмбеддинги: из кэша {reused}, считаю заново {len(missing)} из {len(embed_texts)}")
+    common.log(f"эмбеддинги: из кэша {reused}, считаю заново {len(missing)} из {len(embed_texts)}")
     fe_used = None
     if missing:
         # эмбеддер ТОЛЬКО при промахах: общий сервис (модель в RAM один раз) или локальный
@@ -161,7 +161,7 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
         g_db.query(f"CREATE VECTOR INDEX FOR (n:Entity) ON (n.embedding) "
                    f"OPTIONS {{dimension:{dim}, similarityFunction:'cosine'}}")
     except Exception as ex:
-        print(f"vector index: {ex}")
+        common.log(f"vector index: {ex}")
     try:
         g_db.query("CREATE INDEX FOR (n:Entity) ON (n.id)")
     except Exception:
@@ -169,7 +169,7 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
     try:
         g_db.query("CALL db.idx.fulltext.createNodeIndex('Entity', 'label', 'text')")
     except Exception as ex:
-        print(f"fulltext index: {ex}")
+        common.log(f"fulltext index: {ex}")
 
     erows = [{"s": sc(l["source"]), "t": sc(l["target"]), "rel": sc(l.get("relation", "link")),
               "w": l.get("weight", 1.0)} for l in links]
@@ -193,7 +193,7 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
                      dirty_at_build=gi.get("dirty"), built_at=common.now_iso(),
                      root=str(root), nodes=cnt, edges=rel, model=model_name, graph_sha=gsha)
     if gi.get("dirty"):
-        print("⚠ рабочее дерево грязное — граф отражает закоммиченное + несохранённые правки на диске")
+        common.log("⚠ рабочее дерево грязное — граф отражает закоммиченное + несохранённые правки на диске")
 
-    print(f"✓ граф '{name}': {cnt} узлов, {rel} рёбер. Готово.")
+    common.log(f"✓ граф '{name}': {cnt} узлов, {rel} рёбер. Готово.")
     return {"graph": name, "nodes": cnt, "edges": rel, "dim": dim, "model": model_name}

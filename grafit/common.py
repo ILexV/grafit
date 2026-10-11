@@ -24,6 +24,12 @@ PREFERRED = [
 ]
 
 
+def log(*args) -> None:
+    """Диагностика/прогресс — в stderr: stdout MCP-сервера занят протоколом (JSON-RPC),
+    любой print туда ломает клиенту поток сообщений."""
+    print(*args, file=sys.stderr, flush=True)
+
+
 def project_root(start: Path | None = None) -> Path:
     start = start or Path.cwd()
     try:
@@ -119,36 +125,55 @@ def save_meta(name: str, **kw) -> dict:
 _LOAD_LOCK_FD = None
 
 
-def acquire_load_lock(wait: bool = True, timeout: float = 900.0) -> bool:
-    """Глобальный межпроцессный замок на `grafit load` (один на машину за раз).
+def max_loads() -> int:
+    """Сколько заливок разных проектов идёт одновременно на машине (env GRAFIT_MAX_LOADS, по
+    умолч. 1): общий эмбед-сервис и RAM не тянут N параллельных load."""
+    try:
+        return max(1, int(os.environ.get("GRAFIT_MAX_LOADS", "1")))
+    except ValueError:
+        return 1
+
+
+def acquire_load_lock(wait: bool = True, timeout: float | None = None) -> bool:
+    """Глобальный межпроцессный семафор на `grafit load`: не больше max_loads() заливок
+    на машину (слоты — flock на load.lock, load.lock.1, …).
 
     Хуки разных проектов и быстрые коммиты подряд иначе запускают N конкурентных
     заливок, которые молотят общий эмбед-сервис (см. инцидент 2026-06-17). fd держится
-    до конца процесса — ОС снимает замок при exit, явный unlock не нужен (load одноразовый).
+    до конца процесса — ОС снимает замок при exit (в т.ч. при kill).
 
-    Ожидание ОГРАНИЧЕНО timeout: зависший load не должен блокировать заливки всех проектов
-    навсегда. По истечении — продолжаем без сериализации (это лишь бережёт эмбед-сервис;
-    корректность держит сборка во временный граф + атомарный swap, конкуренции не боится).
+    Ожидание ОГРАНИЧЕНО timeout (env GRAFIT_LOAD_LOCK_TIMEOUT, по умолч. 2 ч): зависший load
+    не должен блокировать заливки навсегда. По истечении — продолжаем без сериализации
+    (корректность держит сборка во временный граф + атомарный swap).
     No-op на платформе без fcntl (Windows) — там вернёт True."""
     global _LOAD_LOCK_FD
     try:
         import fcntl, time
     except Exception:
         return True
+    if timeout is None:
+        timeout = float(os.environ.get("GRAFIT_LOAD_LOCK_TIMEOUT", "7200"))
     HOME.mkdir(parents=True, exist_ok=True)
-    _LOAD_LOCK_FD = open(HOME / "load.lock", "w")
-    waited = 0.0
+    slots = [HOME / ("load.lock" if i == 0 else f"load.lock.{i}") for i in range(max_loads())]
+    waited, said = 0.0, False
     while True:
-        try:
-            fcntl.flock(_LOAD_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except OSError:
-            if not wait:
-                return False
-            if waited >= timeout:
-                print(f"[grafit] глобальный замок занят >{int(timeout)}s — продолжаю без сериализации")
-                return False
-            time.sleep(0.5); waited += 0.5
+        for path in slots:
+            fd = open(path, "w")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _LOAD_LOCK_FD = fd
+                return True
+            except OSError:
+                fd.close()
+        if not wait:
+            return False
+        if waited >= timeout:
+            log(f"[grafit] все {len(slots)} слот(а) заливки заняты >{int(timeout)}s — продолжаю без сериализации")
+            return False
+        if not said:
+            log(f"[grafit] жду свободный слот заливки (одновременно ≤{len(slots)}, GRAFIT_MAX_LOADS)")
+            said = True
+        time.sleep(0.5); waited += 0.5
 
 
 def release_load_lock() -> None:
@@ -264,11 +289,101 @@ def git_info(root) -> dict | None:
     }
 
 
+# Расширения, которые graphify извлекает как КОД (graphify/detect.py CODE_EXTENSIONS):
+# хук graphify пересобирает graph.json только при их изменении, поэтому и «граф отстал»
+# считаем только по ним — коммит с одними .md не делает граф устаревшим.
+CODE_EXTENSIONS = {
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".ejs", ".ets", ".go", ".rs", ".java", ".groovy",
+    ".gradle", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".rb", ".swift", ".kt", ".kts", ".cs",
+    ".scala", ".php", ".lua", ".luau", ".toc", ".zig", ".ps1", ".ex", ".exs", ".m", ".mm", ".jl",
+    ".vue", ".svelte", ".astro", ".dart", ".v", ".sv", ".svh", ".sql", ".r", ".f", ".F", ".f90",
+    ".F90", ".f95", ".F95", ".f03", ".F03", ".f08", ".F08", ".pas", ".pp", ".dpr", ".dpk", ".lpr",
+    ".inc", ".dfm", ".lfm", ".lpk", ".sh", ".bash", ".json", ".tf", ".tfvars", ".hcl", ".dm",
+    ".dme", ".dmi", ".dmm", ".dmf", ".sln", ".slnx", ".csproj", ".fsproj", ".vbproj", ".razor",
+    ".cshtml", ".cls", ".trigger",
+}
+
+
+def load_ignore_patterns(root) -> list[str]:
+    """Шаблоны .graphifyignore корня проекта (как graphify: нет файла — берём .gitignore)."""
+    root = Path(root)
+    for fn in (".graphifyignore", ".gitignore"):
+        p = root / fn
+        if p.exists():
+            out = []
+            for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = raw.strip()
+                if line and not line.startswith("#"):
+                    out.append(line)
+            return out
+    return []
+
+
+def _ignore_match(rel: str, pat: str) -> bool:
+    import fnmatch
+    dir_only = pat.endswith("/")
+    pat = pat.rstrip("/")
+    floating = pat.startswith("**/")
+    if floating:
+        pat = pat[3:]
+    anchored = not floating and "/" in pat
+    pat = pat.lstrip("/")
+    segs = rel.split("/")
+    # кандидаты: сам путь и все его каталоги-предки (каталог ignored ⇒ всё внутри ignored)
+    ends = range(1, len(segs) + (0 if dir_only else 1))
+    for e in ends:
+        if anchored:
+            tails = ["/".join(segs[:e])]
+        elif "/" in pat:          # **/a/b — на любой глубине
+            tails = ["/".join(segs[i:e]) for i in range(e)]
+        else:                     # имя без слэша — любой сегмент
+            tails = [segs[e - 1]]
+        if any(fnmatch.fnmatchcase(t, pat) for t in tails):
+            return True
+    return False
+
+
+def is_ignored(rel: str, patterns: list[str]) -> bool:
+    """Путь (относительно корня) исключён .graphifyignore? gitignore-подобно: last-match-wins,
+    `!` возвращает, `dir/` — каталог, шаблон со `/` привязан к корню, `**/x/` — на любой глубине."""
+    rel = rel.replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    hit = False
+    for pat in patterns:
+        neg = pat.startswith("!")
+        if _ignore_match(rel, pat[1:] if neg else pat):
+            hit = not neg
+    return hit
+
+
+def is_graph_code(rel: str, patterns: list[str]) -> bool:
+    """Попадает ли файл в КОДОВУЮ часть графа (расширение кода и не в .graphifyignore)."""
+    if rel.startswith("graphify-out/"):
+        return False
+    return Path(rel).suffix in CODE_EXTENSIONS and not is_ignored(rel, patterns)
+
+
+def changed_since(root, commit: str) -> list[str] | None:
+    """Файлы (относительно root), изменённые после коммита сборки: закоммиченное после него
+    + незакоммиченные правки отслеживаемых файлов. None — коммит недоступен (gc/другой клон)."""
+    try:
+        r = subprocess.run(["git", "-C", str(root), "diff", "--name-only", "--relative", commit],
+                           capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
+
 def graph_freshness(name: str, live_root=None) -> dict:
     """Насколько граф name отстал от текущего git-состояния рабочего дерева.
 
     Состояния: fresh | dirty | behind | diverged | unknown. live_root — дерево, с
     которым сравниваем (cwd-проект для MCP; meta.root как fallback для CLI).
+    Плюс changed — все файлы, изменённые после сборки (для метки у узлов), и code_changed —
+    только файлы кода графа: по ним решаем, устарел ли граф (доки/прочее его не меняют).
     """
     meta = load_meta().get(name)
     if not meta or not meta.get("commit"):
@@ -278,42 +393,81 @@ def graph_freshness(name: str, live_root=None) -> dict:
     if not live:
         return {"state": "unknown", "reason": "not_git", "graph": meta, "live": None}
     gc = meta["commit"]
+    changed = changed_since(root, gc)
+    pats = load_ignore_patterns(root)
+    extra = {"changed": changed,
+             "code_changed": None if changed is None else [f for f in changed if is_graph_code(f, pats)]}
     if live["commit"] == gc:
         return {"state": "dirty" if live["dirty"] else "fresh",
-                "behind": 0, "graph": meta, "live": live}
+                "behind": 0, "graph": meta, "live": live, **extra}
     anc = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", gc, "HEAD"],
                          capture_output=True).returncode == 0
     if not anc:
-        return {"state": "diverged", "graph": meta, "live": live}
+        return {"state": "diverged", "graph": meta, "live": live, **extra}
     n = subprocess.run(["git", "-C", str(root), "rev-list", "--count", f"{gc}..HEAD"],
                        capture_output=True, text=True).stdout.strip()
     try:
         behind = int(n)
     except ValueError:
         behind = None
-    return {"state": "behind", "behind": behind, "graph": meta, "live": live}
+    return {"state": "behind", "behind": behind, "graph": meta, "live": live, **extra}
 
 
-def freshness_line(name: str, live_root=None) -> str:
-    """Однострочная шапка свежести для каждого ответа инструментов."""
-    f = graph_freshness(name, live_root)
+def is_stale(f: dict, min_commits: int = 1) -> bool:
+    """Граф надо обновить: после сборки изменён КОД графа (или его не сравнить — история
+    разошлась/коммит недоступен). Коммиты только с доками устареванием не считаются."""
+    st = f.get("state")
+    if st in ("fresh", "unknown"):
+        return False
+    code = f.get("code_changed")
+    if code is None:
+        return st == "diverged" or (f.get("behind") or 0) >= min_commits
+    if not code:
+        return False
+    return st in ("dirty", "diverged") or (f.get("behind") or 0) >= min_commits
+
+
+def _files_brief(files: list[str], limit: int = 8) -> str:
+    head = ", ".join(files[:limit])
+    return head + (f" … и ещё {len(files) - limit}" if len(files) > limit else "")
+
+
+# Порог «сильно отстал» — только тогда шапка звучит тревогой; небольшое отставание (пара
+# коммитов, десяток файлов) для большей части кода не мешает: помечаем изменённые файлы.
+ALARM_FILES = int(os.environ.get("GRAFIT_STALE_ALARM_FILES", "30"))
+ALARM_COMMITS = int(os.environ.get("GRAFIT_STALE_ALARM_COMMITS", "50"))
+
+
+def freshness_line(name: str, live_root=None, f: dict | None = None) -> str:
+    """Шапка свежести для каждого ответа инструментов. Мягкая: называет файлы кода, изменённые
+    после сборки (узлы из них помечены — их перепроверь), остальное актуально. Тревога и
+    совет `grafit refresh` — только при большом отставании."""
+    f = f or graph_freshness(name, live_root)
     st = f["state"]
     short = (f.get("graph") or {}).get("short") or "?"
     if st == "fresh":
         return f"граф @ {short} · свежий"
-    if st == "dirty":
-        return (f"⚠ граф @ {short} · рабочее дерево изменено, граф не видит несохранённого — "
-                f"закоммить (хук перельёт) или вручную `graphify . && grafit load`")
-    if st == "behind":
-        n = f.get("behind")
-        dirty = (f.get("live") or {}).get("dirty")
-        tail = " · дерево грязное" if dirty else ""
-        return f"⚠ граф @ {short} · HEAD +{n if n is not None else '?'} коммит(ов){tail} — перезалей `grafit load`"
-    if st == "diverged":
-        return f"⚠ граф @ {short} · другая ветка/история — перезалей `grafit load`"
-    if f.get("reason") == "not_git":
-        return f"граф @ {short} (вне git — свежесть не отслеживается)"
-    return "граф без метки свежести (залит старой версией — перезалей `grafit load`)"
+    if st == "unknown":
+        if f.get("reason") == "not_git":
+            return f"граф @ {short} (вне git — свежесть не отслеживается)"
+        return "граф без метки свежести (залит старой версией — обнови: `grafit refresh`)"
+    behind = f.get("behind")
+    where = {"dirty": "есть незакоммиченные правки",
+             "behind": f"HEAD +{behind if behind is not None else '?'} коммит(ов)",
+             "diverged": "другая ветка/история"}[st]
+    code = f.get("code_changed")
+    if code is None:
+        return (f"граф @ {short} · {where} · список изменений недоступен — при сомнении сверяй "
+                f"с файлом; обновить: `grafit refresh`")
+    if not code:
+        return f"граф @ {short} · {where}, код не менялся (доки/прочее) — выдача актуальна"
+    big = len(code) > ALARM_FILES or (behind or 0) > ALARM_COMMITS
+    if big:
+        return (f"⚠ граф @ {short} сильно отстал · {where} · изменено файлов кода: {len(code)} "
+                f"({_files_brief(code, 5)}). Узлы из них помечены «изменён после сборки»; "
+                f"результаты из неизменённых файлов надёжны. Обновить: `grafit refresh`")
+    return (f"граф @ {short} · {where} · изменены после сборки ({len(code)}): "
+            f"{_files_brief(code)} — узлы из них помечены, их перепроверь; остальное актуально")
 
 
 def freshness_report(name: str, live_root=None) -> str:
@@ -323,33 +477,39 @@ def freshness_report(name: str, live_root=None) -> str:
     head = (f"граф '{name}'  ({m.get('model', '?')}, "
             f"{m.get('nodes', '?')} узлов / {m.get('edges', '?')} рёбер)")
     if not m:
-        return head + "\n  нет метаданных сборки — перезалей: grafit load"
+        return head + "\n  нет метаданных сборки — обнови: grafit refresh"
     built = m.get("built_at", "?")
     short = m.get("short", "?")
     branch = m.get("branch", "?")
     lines = [head, f"  построен:  {built}  на коммите {short} ({branch})"]
     if m.get("dirty_at_build"):
         lines.append("  внимание:  дерево было ГРЯЗНЫМ при сборке (часть правок не в графе)")
-    live = f.get("live")
+    live = f.get("live") or {}
     st = f["state"]
+    ls, lb = live.get("short", "?"), live.get("branch", "?")
     if st == "fresh":
         lines.append(f"  сейчас:    HEAD = {short} · совпадает, дерево чистое")
-        lines.append("  вывод:     граф свежий ✓")
     elif st == "dirty":
-        lines.append(f"  сейчас:    HEAD = {short} · совпадает, но дерево грязное  ⚠")
-        lines.append("  вывод:     закоммить и перезалей, либо граф не видит правок: grafit load")
+        lines.append(f"  сейчас:    HEAD = {short} · совпадает, есть незакоммиченные правки")
     elif st == "behind":
-        ls = live.get("short", "?") if live else "?"
-        lb = live.get("branch", "?") if live else "?"
-        warn = " · дерево грязное  ⚠" if (live or {}).get("dirty") else ""
+        warn = " · дерево грязное" if live.get("dirty") else ""
         lines.append(f"  сейчас:    HEAD = {ls} ({lb}) · +{f.get('behind')} коммита(ов){warn}")
-        lines.append("  вывод:     граф устарел — перезалей: grafit load")
     elif st == "diverged":
-        ls = live.get("short", "?") if live else "?"
-        lines.append(f"  сейчас:    HEAD = {ls} · не потомок коммита сборки (ребейз/смена ветки)  ⚠")
-        lines.append("  вывод:     история разошлась — перезалей: grafit load")
+        lines.append(f"  сейчас:    HEAD = {ls} · не потомок коммита сборки (ребейз/смена ветки)")
     else:
         lines.append("  сейчас:    вне git — свежесть не отслеживается")
+        return "\n".join(lines)
+    code, changed = f.get("code_changed"), f.get("changed")
+    if changed:
+        lines.append(f"  изменено:  файлов {len(changed)}, из них кода графа {len(code or [])}"
+                     + (f": {_files_brief(code)}" if code else ""))
+    if st == "fresh":
+        lines.append("  вывод:     граф свежий ✓")
+    elif not is_stale(f):
+        lines.append("  вывод:     код не менялся — граф актуален ✓")
+    else:
+        lines.append("  вывод:     граф отстал по коду — обнови: grafit refresh "
+                     "(результаты из неизменённых файлов надёжны)")
     return "\n".join(lines)
 
 
@@ -426,13 +586,13 @@ def make_embedder(model_name: str, threads: int = 4):
         cfg = load_config() or {}
         want_fe = cfg.get("fastembed")
         if health is None:
-            print(f"⚠ grafit-embed {url} недоступен — гружу модель локально "
+            log(f"⚠ grafit-embed {url} недоступен — гружу модель локально "
                   f"(подними сервис: `grafit up`)")
         elif health.get("model") != model_name:
-            print(f"⚠ grafit-embed отдаёт модель '{health.get('model')}', а нужна "
+            log(f"⚠ grafit-embed отдаёт модель '{health.get('model')}', а нужна "
                   f"'{model_name}' — векторы бы не сошлись; гружу локально")
         elif want_fe and health.get("fastembed") and health["fastembed"] != want_fe:
-            print(f"⚠ grafit-embed на fastembed {health['fastembed']}, индекс собран на "
+            log(f"⚠ grafit-embed на fastembed {health['fastembed']}, индекс собран на "
                   f"{want_fe} — вектора не сойдутся; гружу локально (или перезалей `--no-cache`)")
         else:
             return RemoteEmbedder(url, model_name)
@@ -832,31 +992,30 @@ def extract_ui_text(root, sf, loc, cache=None, max_chars=240) -> str:
     return " | ".join(out)
 
 
-def node_text(n: dict, comm_labels: dict, root=None, cache=None, snippets=True,
-              include_community=True) -> str:
-    # Порядок: label → сниппет → путь → сообщество → тип. label+сниппет первыми,
-    # чтобы при обрезке по лимиту токенов не терялось имя символа + сигнатура.
-    # include_community=False — для текста, по которому считается эмбеддинг/ключ кэша:
-    # метку сообщества graphify регенерирует при каждой пересборке (недетерминированная
-    # кластеризация), и её участие в ключе инвалидировало бы кэш целиком (см. index.py).
+def node_texts(n: dict, comm_labels: dict, root=None, cache=None, snippets=True) -> tuple[str, str]:
+    """(текст для выдачи/full-text С меткой сообщества, текст для эмбеддинга/кэша БЕЗ неё).
+
+    Порядок: label → сниппет → путь → сообщество → тип. label+сниппет первыми,
+    чтобы при обрезке по лимиту токенов не терялось имя символа + сигнатура.
+    Метку сообщества graphify регенерирует при каждой пересборке (недетерминированная
+    кластеризация) — в ключе кэша эмбеддингов она инвалидировала бы его целиком.
+    Сниппет/доки/UI-текст читаются ОДИН раз на узел."""
     parts = [n.get("label", "")]
     if snippets:
-        snip = read_snippet(root, n.get("source_file"), n.get("source_location"), cache=cache)
-        if snip:
-            parts.append(snip)
-        doc = read_leading_comments(root, n.get("source_file"), n.get("source_location"), cache=cache)
-        if doc:
-            parts.append(doc)
-        ui = extract_ui_text(root, n.get("source_file"), n.get("source_location"), cache=cache)
-        if ui:
-            parts.append(ui)
+        sf, loc = n.get("source_file"), n.get("source_location")
+        parts.append(read_snippet(root, sf, loc, cache=cache))
+        parts.append(read_leading_comments(root, sf, loc, cache=cache))
+        parts.append(extract_ui_text(root, sf, loc, cache=cache))
     sf = n.get("source_file") or ""
     if sf:
         parts.append(sf.replace("/", " ").replace(".", " "))
-    if include_community:
-        cl = comm_labels.get(str(n.get("community")))
-        if cl:
-            parts.append(cl)
-    if n.get("file_type"):
-        parts.append(n["file_type"])
-    return strip_control(" | ".join(p for p in parts if p))
+    tail = [n["file_type"]] if n.get("file_type") else []
+    cl = comm_labels.get(str(n.get("community")))
+    join = lambda ps: strip_control(" | ".join(p for p in ps if p))
+    return join(parts + ([cl] if cl else []) + tail), join(parts + tail)
+
+
+def node_text(n: dict, comm_labels: dict, root=None, cache=None, snippets=True,
+              include_community=True) -> str:
+    full, bare = node_texts(n, comm_labels, root=root, cache=cache, snippets=snippets)
+    return full if include_community else bare

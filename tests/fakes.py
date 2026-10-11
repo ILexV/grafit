@@ -1,0 +1,32 @@
+"""Фейковый граф FalkorDB для тестов поиска/MCP без живой БД.
+
+Узел: (id, label, file_type, source_file, loc, dist). Векторный запрос отдаёт узлы по
+возрастанию dist (как queryNodes), запрос рёбер для _rel_map — из словаря rels.
+"""
+
+
+class _RS:
+    def __init__(self, rows):
+        self.result_set = rows
+
+
+class FakeGraph:
+    def __init__(self, nodes, rels=None):
+        self.nodes = sorted(nodes, key=lambda n: n[5])
+        self.rels = rels or {}          # id -> set(relation)
+        self.vec_calls = []
+
+    def query(self, q, params=None):
+        params = params or {}
+        if "vector.queryNodes" in q:
+            self.vec_calls.append(params["cand"])
+            rows = [(nid, label, ft, sf, loc, "", f"{label} text", dist)
+                    for nid, label, ft, sf, loc, dist in self.nodes[:params["cand"]]]
+            return _RS(rows)
+        if "fulltext" in q:
+            return _RS([])
+        if "collect(DISTINCT r.relation)" in q:
+            return _RS([(i, list(self.rels[i])) for i in params["ids"] if i in self.rels])
+        if "RETURN DISTINCT r.relation" in q:      # neighbors
+            return _RS([])
+        raise AssertionError(f"неожиданный запрос: {q}")
