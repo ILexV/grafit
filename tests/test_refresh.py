@@ -1,0 +1,98 @@
+"""grafit hook install (замена старых вариантов блока, идемпотентность) и план refresh."""
+import os
+import pytest
+from grafit import common, refresh
+
+GRAPHIFY = "#!/bin/sh\n# graphify-hook-start\necho graphify\n# graphify-hook-end\n"
+BLOCK = refresh.hook_block("/opt/bin/grafit")
+
+OLD_MARKED = GRAPHIFY + """
+# --- grafit-hook-start (после graphify-блока) ---
+[ "${GRAFIT_SKIP_HOOK:-0}" = "1" ] && exit 0
+grafit load
+# --- grafit-hook-end ---
+"""
+OLD_SHORT = GRAPHIFY + "# grafit-hook-start\nnohup grafit load &\n# grafit-hook-end\necho tail\n"
+OLD_LEGACY = GRAPHIFY + """
+# grafit: после того как graphify допишет graph.json — залить граф в FalkorDB.
+if command -v grafit >/dev/null 2>&1; then
+    nohup sh -c '
+        ulimit -v 8000000 2>/dev/null; grafit load
+    ' >>~/.cache/grafit-load.log 2>&1 </dev/null &
+fi
+"""
+
+
+@pytest.mark.parametrize("old", [OLD_MARKED, OLD_SHORT, OLD_LEGACY], ids=["marked", "short", "legacy"])
+def test_install_replaces_old_variants(old):
+    new, n, loose = refresh.install_into(old, BLOCK)
+    assert n == 1 and loose == []
+    assert new.count("grafit-hook-start") == 1 and "grafit load" not in new
+    assert new.startswith(GRAPHIFY)                        # graphify-блок не тронут
+    assert new.index("graphify-hook-end") < new.index("grafit-hook-start")
+    again, n2, _ = refresh.install_into(new, BLOCK)
+    assert again == new and n2 == 1                         # идемпотентно
+
+
+def test_install_keeps_tail_after_block():
+    new, _, _ = refresh.install_into(OLD_SHORT, BLOCK)
+    assert new.rstrip().endswith("echo tail")
+
+
+def test_install_into_empty_and_without_graphify():
+    new, n, _ = refresh.install_into("", BLOCK)
+    assert new.startswith("#!/bin/sh") and "grafit-hook-start" in new and n == 0
+    new, _, _ = refresh.install_into("#!/bin/sh\necho x\n", BLOCK)
+    assert new.index("echo x") < new.index("grafit-hook-start")
+
+
+def test_loose_grafit_load_reported():
+    _, _, loose = refresh.install_into(GRAPHIFY + "grafit load\n", BLOCK)
+    assert loose and "grafit load" in loose[0]
+
+
+def test_unclosed_block_refused():
+    with pytest.raises(ValueError):
+        refresh.strip_blocks(GRAPHIFY + "# grafit-hook-start\ngrafit load\n")
+
+
+def test_block_is_valid_shell(tmp_path):
+    p = tmp_path / "h.sh"
+    p.write_text(refresh.install_into(OLD_MARKED, BLOCK)[0])
+    assert os.system(f"sh -n {p}") == 0
+
+
+def test_graph_json_outdated(tmp_path):
+    gj = tmp_path / "graph.json"
+    assert refresh.graph_json_outdated(tmp_path, gj, [])          # нет graph.json
+    (tmp_path / "a.py").write_text("x")
+    gj.write_text("{}")
+    os.utime(gj, (2_000_000_000, 2_000_000_000))
+    assert not refresh.graph_json_outdated(tmp_path, gj, ["a.py"])
+    os.utime(tmp_path / "a.py", (2_000_000_100, 2_000_000_100))
+    assert refresh.graph_json_outdated(tmp_path, gj, ["a.py"])
+    assert refresh.graph_json_outdated(tmp_path, gj, ["deleted.py"])
+
+
+def test_ignored_in_graph_only_code(tmp_path):
+    (tmp_path / ".graphifyignore").write_text("gen/\n.sonarqube/\n")
+    gj = tmp_path / "graph.json"
+    gj.write_text('{"nodes": [{"source_file": "gen/a.py"}, {"source_file": ".sonarqube/d.md"},'
+                  ' {"source_file": "src/b.py"}]}')
+    assert refresh.ignored_in_graph(tmp_path, gj) == ["gen/a.py"]
+
+
+def test_load_slots(tmp_path, monkeypatch):
+    monkeypatch.setattr(common, "HOME", tmp_path)
+    monkeypatch.setenv("GRAFIT_MAX_LOADS", "2")
+    import fcntl
+    held = open(tmp_path / "load.lock", "w")           # слот 0 занят «чужой» заливкой
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        assert common.acquire_load_lock(wait=False)    # взяли слот 1
+        assert common._LOAD_LOCK_FD.name.endswith("load.lock.1")
+        common.release_load_lock()
+        monkeypatch.setenv("GRAFIT_MAX_LOADS", "1")
+        assert not common.acquire_load_lock(wait=False)
+    finally:
+        held.close()

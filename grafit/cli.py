@@ -1,6 +1,6 @@
-"""grafit CLI: up | down | load | query | similar | dupes | eval | list | mcp."""
+"""grafit CLI: up | down | load | refresh | hook | query | similar | dupes | eval | list | mcp."""
 from __future__ import annotations
-import argparse, shutil, subprocess, sys
+import argparse, os, shutil, subprocess, sys
 from pathlib import Path
 
 from . import common
@@ -98,26 +98,46 @@ def _down(args):
     subprocess.run(["docker", "stop", EMBED_CONTAINER, CONTAINER])
 
 
+def _index_kw(args) -> dict:
+    return dict(host=args.host, port=args.port, model=getattr(args, "model", None),
+                no_snippets=getattr(args, "no_snippets", False), no_cache=getattr(args, "no_cache", False),
+                threads=getattr(args, "threads", 4), batch=getattr(args, "batch", 16),
+                build=getattr(args, "build", False), force=getattr(args, "force", False))
+
+
 def _load(args):
-    from . import index
+    from . import refresh
     name = common.graph_name(args.graph or None,
                              common.project_root(Path(args.path) if args.path else None))
-    # «Ровно один отложенный проход на проект»: если заливка этого графа уже идёт — не плодим
-    # второй процесс и не убиваем активный, лишь помечаем rerun и выходим. Активный загрузчик
-    # ниже после своего прохода увидит пометку и сделает ОДИН догоняющий проход на свежем графе.
-    if not common.become_active_loader(name):
-        common.request_rerun(name)
-        print(f"[grafit] заливка '{name}' уже идёт — отложен один повторный проход (rerun)")
-        return
-    while True:
-        common.take_rerun(name)          # снимаем pending: грузим текущее состояние графа
-        index.index_project(project=args.path, graph=args.graph, host=args.host, port=args.port,
-                            model=args.model, no_snippets=args.no_snippets, no_cache=args.no_cache,
-                            threads=args.threads, batch=args.batch, build=args.build, force=args.force)
-        common.release_load_lock()       # отпускаем глобальный замок — даём ход другим проектам
-        if not common.rerun_pending(name):
-            break
-        print(f"[grafit] во время заливки '{name}' пришли изменения — ещё один проход")
+    refresh.load_coalesced(name, project=args.path, **_index_kw(args))
+
+
+def _refresh(args):
+    from . import refresh
+    try:
+        os.nice(args.nice)       # фоновая работа: не мешать интерактиву и идущим load
+    except Exception:
+        pass
+    kw = {"host": args.host, "port": args.port, "threads": args.threads}
+    print(f"[grafit refresh] {refresh._stamp()} старт", flush=True)
+    if args.all_stale:
+        for line in refresh.refresh_all_stale(min_commits=args.min_commits, dry_run=args.dry_run,
+                                              index_kw=kw):
+            print(line, flush=True)
+    else:
+        root = Path(args.path) if args.path else None
+        print(refresh.refresh_project(root, min_commits=args.min_commits, after_hook=args.after_hook,
+                                      skip_graphify=args.skip_graphify, dry_run=args.dry_run,
+                                      index_kw=kw), flush=True)
+
+
+def _hook(args):
+    from . import refresh
+    root = Path(args.path) if args.path else None
+    try:
+        print("\n".join(refresh.hook_install(root, uninstall=args.action == "uninstall")))
+    except ValueError as ex:
+        sys.exit(f"grafit hook: {ex}")
 
 
 def _list(args):
@@ -156,22 +176,33 @@ def _query(args):
     if args.rerank:
         reranker, rname = search.get_reranker(threads=args.threads)
     g = common.connect(args.host, args.port).select_graph(name)
-    rows = search.search(g, qvec, args.question, k=args.k, cand=args.cand,
-                         test_penalty=args.test_penalty, hybrid=args.hybrid,
-                         lex_weight=args.lex_weight, drop_generic=not args.no_generic_filter,
-                         reranker=reranker, kind=args.kind)
+    res = search.search_ex(g, qvec, args.question, k=args.k, cand=args.cand,
+                           test_penalty=args.test_penalty, hybrid=args.hybrid,
+                           lex_weight=args.lex_weight, drop_generic=not args.no_generic_filter,
+                           reranker=reranker, kind=args.kind)
+    rows = res["rows"]
     fresh = common.freshness_line(name, live_root=(None if args.graph else common.project_root()))
+    if not res["candidates"]:
+        print(f"{fresh}\nграф '{name}': пуст (залит ли проект? `grafit load`)"); return
     if not rows:
-        print(f"{fresh}\nграф '{name}': ничего не найдено (залит ли проект?)"); return
+        print(f"{fresh}\n[{name}] {args.question}\nпо фильтру --kind {args.kind} ничего: все "
+              f"{res['filtered_out']} ближайших узлов — другого вида; повтори с --kind all"); return
+    quality = search.match_quality(res["best_dist"])
+    if quality == "none":
+        print(f"{fresh}\n[{name}] {args.question}\nничего похожего (лучший score "
+              f"{1 - res['best_dist']:.3f} < {1 - search.NONE_DIST:.3f}) — такого кода, вероятно, нет"); return
     mode = ("гибрид" if args.hybrid else "вектор") + (f"+реранк:{rname}" if reranker else "")
     mode += f", kind={args.kind}" if args.kind != "all" else ""
+    best = "" if res["best_dist"] is None else f", лучший score {1 - res['best_dist']:.2f}"
+    mode += f", совпадение: {'сильное' if quality == 'strong' else 'слабое — проверь'}{best}"
     print(f"{fresh}\n[{name}] {args.question}   ({mode})\n{'=' * 70}")
     root = common.project_root() if args.snippet else None
     fcache: dict = {}
     nb_shown = False
     for nid, label, ft, sf, loc, clabel, text, score in rows:
         tag = " ·тест" if common.is_test_path(sf) else ""
-        print(f"\n● {label}  ({ft}){tag}")
+        sc = "" if score is None else f"  score {1 - score:.2f}"
+        print(f"\n● {label}  ({ft}){tag}{sc}")
         if sf:
             print(f"   {sf}:{loc}   сообщество: {clabel}")
         if args.snippet:
@@ -269,6 +300,24 @@ def main():
                    help="перезалить даже если graph.json не изменился (обходит coalesce, кэш сохраняется)")
     p.add_argument("--threads", type=int, default=4); p.add_argument("--batch", type=int, default=16)
     p.set_defaults(fn=_load)
+
+    p = sub.add_parser("refresh", help="обновить отставший граф: graphify update (без LLM) + load")
+    p.add_argument("path", nargs="?", default=None, help="корень проекта (по умолч. cwd)")
+    p.add_argument("--all-stale", action="store_true", help="все графы из meta.json, отставшие по коду")
+    p.add_argument("--min-commits", type=int, default=1,
+                   help="обновлять, если отстал хотя бы на N коммитов С ИЗМЕНЕНИЕМ кода (доки не в счёт)")
+    p.add_argument("--after-hook", action="store_true",
+                   help="режим post-commit: дождаться пересборки graph.json graphify-хуком, затем load")
+    p.add_argument("--skip-graphify", action="store_true", help="не запускать graphify update, только load")
+    p.add_argument("--dry-run", action="store_true", help="только показать, что будет обновлено")
+    p.add_argument("--nice", type=int, default=10, help="приоритет процесса (os.nice, по умолч. 10)")
+    p.add_argument("--threads", type=int, default=4)
+    p.set_defaults(fn=_refresh)
+
+    p = sub.add_parser("hook", help="post-commit хук: фоновый grafit refresh после graphify-блока")
+    p.add_argument("action", choices=["install", "uninstall"])
+    p.add_argument("path", nargs="?", default=None, help="корень проекта (по умолч. cwd)")
+    p.set_defaults(fn=_hook)
 
     p = sub.add_parser("list", help="графы проектов"); p.set_defaults(fn=_list)
 
