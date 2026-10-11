@@ -140,3 +140,40 @@ def test_refresh_takes_project_lock_before_graphify(tmp_path, monkeypatch):
     monkeypatch.setattr(refresh, "graphify_update", lambda *a, **k: ran.append(1))
     out = refresh.refresh_project(tmp_path)
     assert "уже идёт" in out and not ran and common.rerun_pending(common.graph_name(None, tmp_path))
+
+
+# --- совет «держи хук локальным» — только для видимого git хука в рабочем дереве ---
+
+def _repo(tmp_path):
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    return tmp_path
+
+
+def test_hook_tip_silent_for_hook_inside_dot_git(tmp_path):
+    root = _repo(tmp_path)
+    hook = root / ".git" / "hooks" / "post-commit"
+    hook.write_text("#!/bin/sh\n")
+    assert refresh.hook_tip(root, hook) is None
+
+
+def test_hook_tip_for_custom_hooks_path_until_excluded(tmp_path):
+    root = _repo(tmp_path)
+    hook = root / ".githooks" / "post-commit"
+    hook.parent.mkdir()
+    hook.write_text("#!/bin/sh\n")
+    tip = refresh.hook_tip(root, hook)
+    assert tip and ".githooks/post-commit >> .git/info/exclude" in tip
+    with open(root / ".git" / "info" / "exclude", "a") as f:
+        f.write(".githooks/post-commit\n")
+    assert refresh.hook_tip(root, hook) is None          # уже исключён — совет лишний
+
+
+def test_hook_tip_warns_when_tracked(tmp_path):
+    import subprocess
+    root = _repo(tmp_path)
+    hook = root / ".githooks" / "post-commit"
+    hook.parent.mkdir()
+    hook.write_text("#!/bin/sh\n")
+    subprocess.run(["git", "-C", str(root), "add", ".githooks/post-commit"], check=True)
+    assert "отслеживается" in refresh.hook_tip(root, hook)

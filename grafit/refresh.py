@@ -313,6 +313,31 @@ def install_into(text: str, block: str) -> tuple[str, int, list[str]]:
     return new, replaced, loose
 
 
+def hook_tip(root: Path, hook: Path) -> str | None:
+    """Совет про локальность хука — только если он в РАБОЧЕМ ДЕРЕВЕ (кастомный core.hooksPath
+    вроде .githooks) и git его видит: хуки в .git/ git не отслеживает никогда, а уже
+    игнорируемый (.git/info/exclude, .gitignore) хук и так локален."""
+    if not hook.exists():
+        return None
+    def git(*a):
+        return subprocess.run(["git", "-C", str(root), *a], capture_output=True, text=True)
+    try:
+        h, r = hook.resolve(), root.resolve()
+        gdirs = [Path(git("rev-parse", flag).stdout.strip()).resolve()
+                 for flag in ("--absolute-git-dir", "--git-common-dir")]
+        gdirs = [d if d.is_absolute() else (r / d) for d in gdirs]
+        if not h.is_relative_to(r) or any(h.is_relative_to(d) for d in gdirs):
+            return None
+    except Exception:
+        return None
+    if git("ls-files", "--error-unmatch", str(h)).returncode == 0:
+        return "  ⚠ хук отслеживается git — не коммить grafit-блок (он личный)"
+    if git("check-ignore", "-q", str(h)).returncode == 0:
+        return None
+    rel = os.path.relpath(h, r)
+    return f"  хук внутри репо: держи локальным — `echo {rel} >> .git/info/exclude`"
+
+
 def hook_install(root: Path, uninstall: bool = False) -> list[str]:
     root = common.project_root(root)
     hd = hooks_dir(root)
@@ -338,16 +363,7 @@ def hook_install(root: Path, uninstall: bool = False) -> list[str]:
         msg.append("  без изменений")
     for ln in loose:
         msg.append(f"  ⚠ вне маркеров осталось: {ln} — убери вручную, иначе заливка дважды")
-    try:
-        inside = hook.resolve().is_relative_to(root.resolve())
-    except Exception:
-        inside = False
-    if inside and hook.exists():
-        tracked = subprocess.run(["git", "-C", str(root), "ls-files", "--error-unmatch", str(hook)],
-                                 capture_output=True).returncode == 0
-        if tracked:
-            msg.append("  ⚠ хук отслеживается git — не коммить grafit-блок (он личный)")
-        else:
-            rel = os.path.relpath(hook, root)
-            msg.append(f"  хук внутри репо: держи локальным — `echo {rel} >> .git/info/exclude`")
+    tip = hook_tip(root, hook)
+    if tip:
+        msg.append(tip)
     return msg
