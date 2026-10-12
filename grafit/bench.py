@@ -91,15 +91,15 @@ def run(path=None, graphs=None, host="localhost", port=6399, threads=4, log=prin
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(it["body"], encoding="utf-8")
             anchor = dupes.worktree_text(tmp, it["file"], it["symbol"])
+            # similar по файлу: объявления извлекает decls (как grafit_similar(file=) и хук)
+            fanchors, _ = dupes.file_anchors(tmp, it["file"], base=None)
+        fa = next((a for a in fanchors if a["label"] == it["symbol"]), None)
+        rec["similar"] = _similar_rank(g, emb, anchor, it["expect"])
+        rec["similar_file"] = _similar_rank(g, emb, fa, it["expect"])
         if anchor is None:
             log(f"⚠ {it['id']}: символ {it['symbol']} не найден в теле")
-            rec["similar"] = None
-        else:
-            sres = dupes.similar_to_text(g, emb.passage(anchor["text"]), anchor, k=max(KS))
-            copies = sres.get("copies") or {}
-            rows = [(c[1], c[3], [x[:2] for x in copies.get(c[0], ())])
-                    for c in sres["candidates"] + sres["near"]]
-            rec["similar"] = first_rank(rows, it["expect"])
+        if fa is None:
+            log(f"⚠ {it['id']}: decls не извлёк объявление {it['symbol']}")
         out["items"].append(rec)
     for gname in bench["none"]["graphs"]:
         if gname not in have or (want and gname not in want):
@@ -112,6 +112,16 @@ def run(path=None, graphs=None, host="localhost", port=6399, threads=4, log=prin
     return out
 
 
+def _similar_rank(g, emb, anchor, expect):
+    if anchor is None:
+        return None
+    sres = dupes.similar_to_text(g, emb.passage(anchor["text"]), anchor, k=max(KS))
+    copies = sres.get("copies") or {}
+    rows = [(c[1], c[3], [x[:2] for x in copies.get(c[0], ())])
+            for c in sres["candidates"] + sres["near"]]
+    return first_rank(rows, expect)
+
+
 def _exists(g, e) -> bool:
     rs = g.query("MATCH (n:Entity) WHERE n.source_file = $sf RETURN n.label",
                  params={"sf": e["sf"]}).result_set
@@ -121,7 +131,7 @@ def _exists(g, e) -> bool:
 def summary(res: dict) -> dict:
     items = res["items"]
     s = {"n": len(items), "none_n": len(res["none"])}
-    for key in ("q", "q_en", "similar"):
+    for key in ("q", "q_en", "similar", "similar_file"):
         s[key] = recall([it.get(key) for it in items])
     strong = [it for it in items if it.get("q_strong")]
     s["strong_n"] = len(strong)
@@ -139,14 +149,16 @@ def format_table(res: dict) -> str:
              "| инструмент | R@1 | R@3 | R@8 |", "|---|---|---|---|"]
     for key, title in (("q", "find_existing (q, по-русски)"),
                        ("q_en", "find_existing (q_en, + код по-англ.)"),
-                       ("similar", "similar (тело, file=)")):
+                       ("similar", "similar (тело, file=)"),
+                       ("similar_file", "similar по файлу (decls)")):
         lines.append(f"| {title} | " + " | ".join(pct(s[key][k]) for k in KS) + " |")
     lines += ["", f"«сильное» на q: {s['strong_n']} из {s['n']}; из них аналог в топ-3 — "
               f"{pct(s['strong_top3'])}, первым — {pct(s['strong_precision'])}",
               f"«ни о чём»: ложных «сильное» {s['none_strong']} из {s['none_n']}, "
               f"«ничего похожего» {s['none_said_none']} из {s['none_n']}", "",
-              "| пара | q | q_en | similar |", "|---|---|---|---|"]
+              "| пара | q | q_en | similar | по файлу |", "|---|---|---|---|---|"]
     fmt = lambda r: "—" if r is None else str(r)
     for it in res["items"]:
-        lines.append(f"| {it['id']} | {fmt(it['q'])} | {fmt(it['q_en'])} | {fmt(it['similar'])} |")
+        lines.append(f"| {it['id']} | {fmt(it['q'])} | {fmt(it['q_en'])} | {fmt(it['similar'])} "
+                     f"| {fmt(it.get('similar_file'))} |")
     return "\n".join(lines)

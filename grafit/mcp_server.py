@@ -405,22 +405,27 @@ def grafit_trace(source: str, project: str = "", max_hops: int = 4, target: str 
 
 
 @_tool
-def grafit_similar(symbol: str, project: str = "", file: str = "", k: int = 8,
+def grafit_similar(symbol: str = "", project: str = "", file: str = "", base: str = "", k: int = 8,
                    threshold: float = 0.10, kind: str = "auto", rerank: bool = False,
                    snippet: bool = True) -> str:
-    """Не дублирует ли символ уже существующий код — near-duplicate по телу (код→код).
-    Только что написал функцию — передай file=путь: символ читается из РАБОЧЕГО ДЕРЕВА, даже
-    если его ещё нет в графе (проверка на приёмке). Без file — символ из графа.
-
-    Выдача: вероятные дубли (dist ≤ threshold, дефолт 0.10) + ближайшие за порогом со score.
-    Пусто в пределах порога ≠ дублей нет: дубль другой формы similar не видит — тогда зови
-    grafit_find_existing(«что делает символ»). kind=auto: prod, для теста — tests.
-    [копипаст]/[семантика] — буквальная копия vs похожая логика."""
+    """Не дублирует ли код уже существующий — near-duplicate по телу (код→код).
+    file=путь — читается РАБОЧЕЕ ДЕРЕВО (символа может не быть в графе). file без symbol —
+    все объявления файла; base="HEAD" (или ветка) — только новые/изменённые в diff.
+    Выдача: вероятные дубли dist≤threshold + ближайшие за порогом. Пусто ≠ дублей нет:
+    дубль другой формы similar не видит — зови grafit_find_existing. kind=auto: prod/tests."""
     g, name = _graph(project or None)
     reranker = search.get_reranker(threads=THREADS)[0] if rerank else None
     root = _root(name)
+    rel = (os.path.relpath(os.path.abspath(file), root) if os.path.isabs(file) else file) if file else ""
+    if file and not symbol:
+        lines = dupes.format_similar_file(g, name, root, rel, lambda ts: _embed_passages(ts)[0],
+                                          base=base or None, k=min(k, 3), threshold=threshold,
+                                          kind=kind)
+        _stat_set(n=sum(1 for ln in lines if ln.lstrip().startswith("≈")))
+        return "\n".join([_fresh(name, project or None)] + lines)
+    if not symbol:
+        return "нужен symbol или file"
     if file:
-        rel = os.path.relpath(os.path.abspath(file), root) if os.path.isabs(file) else file
         anchor = dupes.worktree_text(root, rel, symbol)
         if not anchor:
             _stat_set(n=0)
@@ -434,6 +439,18 @@ def grafit_similar(symbol: str, project: str = "", file: str = "", k: int = 8,
                                      reranker=reranker, root=root if snippet else None)
     _stat_set(n=sum(1 for ln in lines if ln.lstrip().startswith(("≈", "~"))))
     return "\n".join([_fresh(name, project or None)] + lines)
+
+
+def _embed_passages(texts: list[str]):
+    """Векторы кода пачкой, как у узлов при индексации (e5: префикс 'passage: ')."""
+    global _embedder
+    cfg = common.load_config()
+    if not cfg:
+        raise RuntimeError("grafit не сконфигурирован — выполни `grafit load` хотя бы в одном проекте")
+    if _embedder is None:
+        _embedder = search.get_embedder(cfg, threads=THREADS)
+    ts = [("passage: " + t) if cfg["is_e5"] else t for t in texts]
+    return [v.tolist() for v in _embedder.embed(ts)], cfg
 
 
 def _embed_passage(text: str):

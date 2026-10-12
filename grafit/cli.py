@@ -251,6 +251,29 @@ def _similar(args):
     fresh = common.freshness_line(name, live_root=(None if args.graph else common.project_root()))
     reranker = search.get_reranker(threads=args.threads)[0] if args.rerank else None
     root = common.project_root() if args.snippet else None
+    if args.file:
+        import os
+        cfg = common.load_config()
+        model = search.get_embedder(cfg, threads=args.threads)
+        pfx = "passage: " if cfg["is_e5"] else ""
+        emb = lambda ts: [v.tolist() for v in model.embed([pfx + t for t in ts])]
+        live = common.project_root()
+        rel = os.path.relpath(os.path.abspath(args.file), live)
+        if args.symbol:
+            anchor = dupes.worktree_text(live, rel, args.symbol)
+            if not anchor:
+                sys.exit(f"'{args.symbol}' не найден в {rel}")
+            lines = dupes.format_similar_text(g, name, anchor, emb([anchor["text"]])[0], k=args.k,
+                                              threshold=args.threshold, kind=args.kind,
+                                              reranker=reranker, root=root)
+        else:
+            lines = dupes.format_similar_file(g, name, live, rel, emb, base=args.base or None,
+                                              k=min(args.k, 3), threshold=args.threshold,
+                                              kind=args.kind)
+        print("\n".join([fresh] + lines))
+        return
+    if not args.symbol:
+        sys.exit("нужен symbol или --file")
     print("\n".join([fresh] + dupes.format_similar(
         g, name, args.symbol, k=args.k, threshold=args.threshold, kind=args.kind,
         reranker=reranker, root=root)))
@@ -372,7 +395,10 @@ def main():
     p.set_defaults(fn=_trace)
 
     p = sub.add_parser("similar", help="near-duplicate символы для символа (кандидаты на рефакторинг)")
-    p.add_argument("symbol"); p.add_argument("--graph", default=None)
+    p.add_argument("symbol", nargs="?", default=None); p.add_argument("--graph", default=None)
+    p.add_argument("--file", default=None,
+                   help="файл рабочего дерева; без symbol — все его объявления (или diff с --base)")
+    p.add_argument("--base", default=None, help="с --file: только новое/изменённое vs ревизии (HEAD)")
     p.add_argument("-k", type=int, default=8)
     p.add_argument("--threshold", type=float, default=0.10, help="макс. косинусная дистанция (0=идентично)")
     p.add_argument("--kind", choices=["auto", "all", "code", "tests", "docs", "prod", "frontend",

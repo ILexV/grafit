@@ -43,3 +43,11 @@ def test_live_bench_recall_floor():
         pytest.skip("графы эталона не залиты")
     assert s["q"][8] >= 0.85 and s["q_en"][8] >= 0.95 and s["similar"][8] >= 0.85
     assert s["none_strong"] == 0
+
+
+def test_decls_extracts_every_bench_symbol():
+    # similar по файлу и хук видят только то, что извлёк decls — эталонные символы обязаны быть
+    from grafit import decls
+    for it in bench.load_bench()["items"]:
+        names = [n for n, _ in decls.declarations(it["file"], it["body"])]
+        assert it["symbol"] in names, (it["id"], names)

@@ -429,18 +429,20 @@ def _filter_near(graph, qvec, self_id, self_label, self_sf, linked, k, kind,
     return out
 
 
-def worktree_text(root, sf: str, symbol: str, cache=None) -> dict | None:
+def worktree_text(root, sf: str, symbol: str, cache=None, line: int | None = None) -> dict | None:
     """Текст символа из ТЕКУЩЕЙ версии файла (рабочее дерево) в том же формате, что узел
     при индексации, — для проверки «не дублирует ли только что написанный код старый», даже
-    если символа ещё нет в графе. None — файла/символа нет."""
+    если символа ещё нет в графе. line — строка объявления, если известна (иначе первое
+    вхождение имени). None — файла/символа нет."""
     cache = {} if cache is None else cache
     lines = common._file_lines(root, sf, cache)
     if not lines:
         return None
-    bare = nav._bare(symbol)
-    rx = re.compile(rf"(?<![\w$]){re.escape(bare)}(?![\w$])")
-    line = next((i for i, ln in enumerate(lines, 1) if rx.search(ln)), None)
     if line is None:
+        bare = nav._bare(symbol)
+        rx = re.compile(rf"(?<![\w$]){re.escape(bare)}(?![\w$])")
+        line = next((i for i, ln in enumerate(lines, 1) if rx.search(ln)), None)
+    if line is None or not 1 <= line <= len(lines):
         return None
     node = {"label": symbol, "source_file": sf, "source_location": f"L{line}", "file_type": "code"}
     return {"label": symbol, "sf": sf, "loc": f"L{line}",
@@ -689,6 +691,85 @@ def format_similar_text(graph, name: str, anchor: dict, qvec, k: int = 6, thresh
     out = [f"[{name}] дубли ~ {anchor['label']} (рабочее дерево: {anchor['sf']}:{anchor['loc']})  "
            f"порог dist≤{threshold} · kind={res['kind']}"]
     return out + _similar_body(res, threshold, anchor["label"], root)
+
+
+FILE_MAX_DECLS = 40            # потолок объявлений на файл: ответ и время ограничены
+
+
+def file_anchors(root, sf: str, base: str | None = "HEAD", cache=None) -> tuple[list, int]:
+    """Якоря similar для объявлений файла из рабочего дерева: ([anchor], всего объявлений).
+    base — только новые/изменённые относительно этой ревизии (git diff), None — все объявления;
+    файл вне git — целиком новый."""
+    from . import decls
+    cache = {} if cache is None else cache
+    lines = common._file_lines(root, sf, cache)
+    if not lines:
+        return [], 0
+    text = "\n".join(lines)
+    alld = decls.declarations(sf, text)
+    picked = alld if base is None else decls.changed_declarations(
+        sf, text, decls.changed_lines(root, sf, base))
+    out = []
+    for name, line in picked:
+        a = worktree_text(root, sf, name, cache=cache, line=line)
+        if a is not None:
+            out.append(a)
+    return out, len(alld)
+
+
+def similar_file(graph, anchors, embed_passages, k: int = 3, threshold: float = 0.10,
+                 kind: str = "auto") -> list[tuple[dict, dict]]:
+    """similar_to_text для каждого якоря файла; эмбеддинги одной пачкой (embed_passages:
+    [text] → [vec]). → [(anchor, res)] в порядке объявлений."""
+    anchors = anchors[:FILE_MAX_DECLS]
+    if not anchors:
+        return []
+    vecs = embed_passages([a["text"] for a in anchors])
+    return [(a, similar_to_text(graph, v, a, k=k, threshold=threshold, kind=kind))
+            for a, v in zip(anchors, vecs)]
+
+
+def format_similar_file(graph, name: str, root, sf: str, embed_passages, base: str | None = "HEAD",
+                        k: int = 3, threshold: float = 0.10, kind: str = "auto") -> list[str]:
+    """similar по всему файлу/диффу: группы по символу с вероятными дублями (dist≤порога),
+    остальные — одной строкой «проверено N, без вероятных дублей» с ближайшим кандидатом.
+    Как и similar, никогда не обещает «дублей нет»."""
+    anchors, total = file_anchors(root, sf, base)
+    scope = f"diff vs {base}" if base else "все объявления"
+    if total == 0:
+        from . import decls
+        why = ("объявлений функций/классов не найдено" if decls.supported(sf)
+               else "язык не поддержан (TS/JS, C#, Python)")
+        return [f"[{name}] {sf}: {why} — проверь grafit_similar(symbol=…, file=…) или "
+                f"grafit_find_existing"]
+    if not anchors:
+        return [f"[{name}] {sf} ({scope}): новых/изменённых объявлений нет "
+                f"(всего в файле {total}; все — base=\"\")"]
+    cut = len(anchors) > FILE_MAX_DECLS
+    pairs = similar_file(graph, anchors, embed_passages, k=k, threshold=threshold, kind=kind)
+    kinds = sorted({res["kind"] for _, res in pairs})
+    out = [f"[{name}] дубли объявлений {sf} ({scope}: {len(pairs)} из {total})  "
+           f"порог dist≤{threshold} · kind={','.join(kinds)}"]
+    clean = []
+    for a, res in pairs:
+        if not res["candidates"]:
+            near = res["near"][:1]
+            clean.append(f"{a['label']} (~{near[0][6]:.3f} {near[0][1]})" if near else a["label"])
+            continue
+        copies = res.get("copies") or {}
+        out.append(f"\n■ {a['label']}  {sf}:{a['loc']}  — вероятные дубли: {len(res['candidates'])}")
+        for nid, lbl, ft, csf, loc, text, dist, jacc in res["candidates"]:
+            out.append(f"  ≈{dist:.4f}  [{_tag(jacc >= LITERAL_JACCARD, jacc)}]  {lbl}  "
+                       f"score {1 - dist:.2f}  {csf}:{loc}")
+            out.extend(copy_lines(copies.get(nid), indent="          "))
+    if clean:
+        out.append(f"\nпроверено {len(clean)}, без вероятных дублей (dist≤{threshold}; в скобках "
+                   f"ближайший): " + ", ".join(clean))
+        out.append("  это НЕ значит, что дублей нет: дубль другой формы лежит за порогом — для "
+                   "новой логики спроси grafit_find_existing(\"что делает, словами\")")
+    if cut:
+        out.append(f"\n⚠ проверены первые {FILE_MAX_DECLS} объявлений — остальные: symbol=…")
+    return out
 
 
 def _hist_lines(items) -> list[str]:
