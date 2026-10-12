@@ -364,7 +364,7 @@ def main():
 
     p = sub.add_parser("similar", help="near-duplicate символы для символа (кандидаты на рефакторинг)")
     p.add_argument("symbol"); p.add_argument("--graph", default=None)
-    p.add_argument("-k", type=int, default=6)
+    p.add_argument("-k", type=int, default=8)
     p.add_argument("--threshold", type=float, default=0.10, help="макс. косинусная дистанция (0=идентично)")
     p.add_argument("--kind", choices=["auto", "all", "code", "tests", "docs", "prod", "frontend",
                                       "backend"], default="auto",

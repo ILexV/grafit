@@ -44,13 +44,16 @@ _REF_ONLY_RELS = {"references", "imports", "imports_from"}
 
 
 def _rel_map(graph, ids: list[str]) -> dict:
-    """id → множество типов инцидентных рёбер (обе стороны). Один запрос на пачку."""
-    if not ids:
-        return {}
-    rs = graph.query(
-        "MATCH (n:Entity)-[r:LINK]-(m:Entity) WHERE n.id IN $ids "
-        "RETURN n.id, collect(DISTINCT r.relation)", params={"ids": ids}).result_set
-    return {row[0]: set(row[1]) for row in rs}
+    """id → множество типов инцидентных рёбер (обе стороны). Запрос на пачку; пачки не больше
+    common.PAGE — ответ FalkorDB обрезается на 10000 строк (скан дублей шлёт десятки тысяч id)."""
+    out: dict = {}
+    for i in range(0, len(ids), common.PAGE):
+        rs = graph.query(
+            "MATCH (n:Entity)-[r:LINK]-(m:Entity) WHERE n.id IN $ids "
+            "RETURN n.id, collect(DISTINCT r.relation)",
+            params={"ids": ids[i:i + common.PAGE]}).result_set
+        out.update((row[0], set(row[1])) for row in rs)
+    return out
 
 
 def _is_fragment(c, relmap: dict) -> bool:

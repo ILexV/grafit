@@ -193,8 +193,9 @@ grafit — граф кода проекта с поиском ПО СМЫСЛУ 
 Главное: не писать заново то, что в проекте уже есть. Проекты большие, код писали разные
 модели, имена непредсказуемы — grep по тексту не находит, grafit находит по смыслу (синонимы,
 RU/EN, опечатки, другое название).
-• ПЕРЕД созданием метода/класса/сервиса/хука/компонента — grafit_find_existing("что он делает,
-  словами"): покажет похожий существующий код со score. Нашлось сильное — переиспользуй/расширь.
+• Перед Write/Edit, создающим новую функцию/класс/сервис/хук/компонент, — grafit_find_existing
+  («что он делает» по-русски + ключевые слова кода по-английски: «сумма в рублях, Intl.NumberFormat
+  ru-RU»): покажет похожий существующий код со score. Нашлось — переиспользуй/расширь.
 • Разведка «где/как реализовано X» — grafit_search первым, до Read/Grep:
   «где проверяется доступ к филиалу» → классы/методы с path:line. grep — для известной строки.
 • Перед правкой/удалением символа — grafit_impact (кто использует, в т.ч. непрямо) и
@@ -265,7 +266,7 @@ def _search_rows(question, project, k, kind):
     return g, name, res
 
 
-def _render_rows(g, name, rows, fr, snippet, neighbors, contracts=None) -> list[str]:
+def _render_rows(g, name, rows, fr, snippet, neighbors, contracts=None, copies=None) -> list[str]:
     root = _root(name) if snippet else None
     fcache: dict = {}
     out, any_nb = [], False
@@ -275,6 +276,7 @@ def _render_rows(g, name, rows, fr, snippet, neighbors, contracts=None) -> list[
         if contracts and nid in contracts:
             clabel_, csf = contracts[nid]
             out.append(f"  ↳ контракт: {clabel_} ({csf}) — свёрнут сюда, это не дубль")
+        out.extend(dupes.copy_lines((copies or {}).get(nid)))
         if snippet:
             out.extend(_quote(root, sf, loc, fcache, label, sf in fr.changed))
         for d, rel, mlabel, msf in (search.neighbors(g, nid, neighbors) if neighbors else []):
@@ -301,18 +303,22 @@ def grafit_search(question: str, k: int = 8, project: str = "", kind: str = "pro
     if empty:
         return empty
     out = [fr.line, f"[{name}] {question}  (kind={kind} · {_verdict(res)})"]
-    out.extend(_render_rows(g, name, res["rows"], fr, snippet, neighbors, res["contracts"]))
+    out.extend(_render_rows(g, name, res["rows"], fr, snippet, neighbors, res["contracts"],
+                            res.get("copies")))
     return "\n".join(out)
 
 
 @_tool
-def grafit_find_existing(description: str, k: int = 6, project: str = "", kind: str = "prod") -> str:
+def grafit_find_existing(description: str, k: int = 8, project: str = "", kind: str = "auto",
+                         file: str = "") -> str:
     """ПЕРЕД тем как писать новую функцию/класс/сервис/хук/компонент — нет ли такого уже в проекте.
-    Опиши назначение словами: «пересчитать норму часов сотрудника за месяц» → похожий
-    существующий код со score и строками исходника; устойчив к другим названиям и опечаткам.
+    Опиши назначение по-русски + ключевые слова кода по-английски: «скачать файл в браузере,
+    Blob, createObjectURL» → похожий существующий код со score и строками исходника.
 
-    Сильное совпадение — переиспользуй/расширь найденное вместо нового кода. Сильное = лидер
-    выделяется из фона; при слабом аналог всё равно может быть в списке — проверь чтением."""
+    Сильное = лидер выделяется из фона; при слабом аналог всё равно может быть в списке.
+    file — куда пишешь новый код: kind=auto выберет по нему (служебный .claude/… → code)."""
+    if kind == "auto":
+        kind = dupes.auto_kind(file) if file else "prod"
     g, name, res = _search_rows(description, project, k, kind)
     fr = _Fresh(name, project or None)
     empty = _empty_answer(fr, name, description, kind, res)
@@ -325,7 +331,10 @@ def grafit_find_existing(description: str, k: int = 6, project: str = "", kind: 
     out = [fr.line, f"[{name}] уже есть? «{description}»  (kind={kind} · {_verdict(res)})",
            f"вывод: {advice}"]
     out.extend(_render_rows(g, name, res["rows"], fr, snippet=True, neighbors=0,
-                            contracts=res["contracts"]))
+                            contracts=res["contracts"], copies=res.get("copies")))
+    if kind == "prod" and q != "strong":
+        out.append("\n(kind=prod: служебный код .claude/, .opencode/, скрипты конвейера не входит — "
+                   "для него kind=code или file=путь)")
     return "\n".join(out)
 
 
@@ -396,7 +405,7 @@ def grafit_trace(source: str, project: str = "", max_hops: int = 4, target: str 
 
 
 @_tool
-def grafit_similar(symbol: str, project: str = "", file: str = "", k: int = 6,
+def grafit_similar(symbol: str, project: str = "", file: str = "", k: int = 8,
                    threshold: float = 0.10, kind: str = "auto", rerank: bool = False,
                    snippet: bool = True) -> str:
     """Не дублирует ли символ уже существующий код — near-duplicate по телу (код→код).

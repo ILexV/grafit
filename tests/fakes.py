@@ -11,23 +11,28 @@ class _RS:
 
 
 class FakeGraph:
-    def __init__(self, nodes, rels=None, owners=None, supers=None):
+    def __init__(self, nodes, rels=None, owners=None, supers=None, texts=None):
         self.nodes = sorted(nodes, key=lambda n: n[5])
+        self.texts = texts or {}        # id -> node.text (по умолч. уникальный: свёртка копий не сработает)
         self.rels = rels or {}          # id -> set(relation)
         self.owners = owners or {}      # id члена -> имя типа-владельца (ребро method)
         self.supers = supers or {}      # имя типа -> [имена интерфейсов/баз]
         self.vec_calls = []
 
+    def _text(self, nid, label):
+        return self.texts.get(nid, f"{label} | body of {nid}")
+
     def query(self, q, params=None):
         params = params or {}
         if "vector.queryNodes" in q and "k" in params:   # dupes.nearest: (id,label,ft,sf,loc,text,dist)
-            return _RS([(nid, label, ft, sf, loc, f"{label} text", dist)
+            self.vec_calls.append(params["k"])
+            return _RS([(nid, label, ft, sf, loc, self._text(nid, label), dist)
                         for nid, label, ft, sf, loc, dist in self.nodes[:params["k"]]])
         if "m.source_file = $sf" in q:                    # dupes.file_types — типы файла
             return _RS([])
         if "vector.queryNodes" in q:
             self.vec_calls.append(params["cand"])
-            rows = [(nid, label, ft, sf, loc, "", f"{label} text", dist)
+            rows = [(nid, label, ft, sf, loc, "", self._text(nid, label), dist)
                     for nid, label, ft, sf, loc, dist in self.nodes[:params["cand"]]]
             return _RS(rows)
         if "fulltext" in q:

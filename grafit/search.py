@@ -68,6 +68,10 @@ STRONG_GAP = float(os.environ.get("GRAFIT_STRONG_GAP", "0.013"))
 BG_POOL = 40
 
 
+# Минимальный пул векторного индекса: HNSW при малом k теряет верных соседей (см. dupes.POOL).
+VEC_POOL = 240
+
+
 def match_quality(dist, bg=None) -> str:
     """strong | weak | none — насколько лучший результат похож на запрос (по дистанции).
     bg — фон (медиана дистанций соседей): без отрыва от него совпадение не «сильное»."""
@@ -111,13 +115,13 @@ def search_ex(graph, qvec, question, k=8, cand=60, test_penalty=0.5,
     elif kind != "all":
         vcand = max(cand * 4, k * 30)   # docs/тесты/.scratch часто занимают большую часть топа
     elif dedupe or hide_fragments:
-        vcand = max(cand, k * 8)
+        vcand = max(cand, k * 8, VEC_POOL)
     else:
         vcand = cand
     vec_rows = graph.query(_VEC_Q, params={"cand": vcand, "q": qvec}).result_set
     lex_rows = _lexical(graph, question, vcand) if hybrid else []
     empty = {"rows": [], "filtered_out": 0, "candidates": 0, "best_dist": None, "bg_dist": None,
-             "contracts": {}}
+             "contracts": {}, "copies": {}}
     if not vec_rows and not lex_rows:
         return empty
 
@@ -153,9 +157,11 @@ def search_ex(graph, qvec, question, k=8, cand=60, test_penalty=0.5,
     # фон — по очищенному списку: дубли одной строки и фрагменты тянули бы медиану к топу
     bg = background(vdist.get(nid) for nid in order)
     contracts: dict = {}
+    copies: dict = {}
     if collapse:
         order = _collapse_files(order, by_id)
-        order, contracts = _collapse_contracts(graph, order[:k * 2], by_id)
+        order, contracts = _collapse_contracts(graph, order[:k * 3], by_id)
+        order, copies = _collapse_copies(order, by_id)
 
     if len(order) < k and widen:
         # фильтр съел почти весь пул — один повторный проход с пулом вчетверо шире
@@ -178,7 +184,8 @@ def search_ex(graph, qvec, question, k=8, cand=60, test_penalty=0.5,
     return {"rows": rows, "filtered_out": len(by_id) - len(idset), "candidates": len(by_id),
             "best_dist": min(dists) if dists else None,
             "bg_dist": bg,
-            "contracts": {nid: c for nid, c in contracts.items() if nid in set(order[:k])}}
+            "contracts": {nid: c for nid, c in contracts.items() if nid in set(order[:k])},
+            "copies": {nid: c for nid, c in copies.items() if nid in set(order[:k])}}
 
 
 def _is_file_node(r) -> bool:
@@ -203,6 +210,13 @@ def _collapse_files(order, by_id):
         used.add(nid)
         out.append(nid)
     return out
+
+
+def _collapse_copies(order, by_id):
+    """Копии одной функции по разным файлам — одна строка (dupes.collapse_copies)."""
+    from . import dupes
+    return dupes.collapse_copies([(nid, by_id[nid][1], by_id[nid][3], by_id[nid][4], by_id[nid][6])
+                                  for nid in order])
 
 
 def _collapse_contracts(graph, order, by_id):

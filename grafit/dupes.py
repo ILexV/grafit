@@ -219,6 +219,57 @@ def jaccard(a: frozenset, b: frozenset) -> float:
     return inter / (len(a) + len(b) - inter)
 
 
+# --- свёртка копипаста в выдаче ---------------------------------------------------
+# Копии одной функции по разным файлам занимают несколько мест топа (bi: percentFormatter
+# в PnlTable и PnlComparisonTable — два первых места на «сумма в рублях»). Сворачиваем их в
+# одну строку «×N копипаст»: место освобождается, а сам копипаст подсвечивается. Сравниваем
+# только код (без имени и токенов пути — они занижали сходство копий из разных файлов).
+COPY_SAME_NAME_J = 0.30       # одноимённые: percentFormatter ×2 — 0.27 по всему тексту
+COPY_OTHER_NAME_J = 0.70      # разноимённые — только почти дословные
+
+
+def code_part(label: str | None, sf: str | None, text: str | None) -> str:
+    """Код объявления из текста узла (label | сниппет | доки | путь | …): без имени, хвоста с
+    путём и того, что после первой пустой строки, — сниппет берёт 12 строк, и у короткой
+    константы большую часть занимает соседний код (у копий percentFormatter он разный)."""
+    t = text or ""
+    head = (label or "") + " | "
+    if t.startswith(head):
+        t = t[len(head):]
+    path = (sf or "").replace("/", " ").replace(".", " ")
+    cut = t.rfind(" | " + path) if path else -1
+    t = t[:cut] if cut > 0 else t
+    return t.split("\n\n", 1)[0]
+
+
+def is_copy(a, b) -> bool:
+    """a, b = (label, sf, text): одна функция, скопированная в другой файл?"""
+    return _is_copy(a[0], a[1], shingles(code_part(*a)), b[0], b[1], shingles(code_part(*b)))
+
+
+def _is_copy(al, asf, ash, bl, bsf, bsh) -> bool:
+    if not asf or not bsf or asf == bsf:
+        return False
+    same = nav._norm(al) == nav._norm(bl)
+    return jaccard(ash, bsh) >= (COPY_SAME_NAME_J if same else COPY_OTHER_NAME_J)
+
+
+def collapse_copies(items) -> tuple[list, dict]:
+    """items — (id, label, sf, loc, text) в порядке выдачи → (id оставшихся, copies), где
+    copies[id] = [(label, sf, loc), …] — свёрнутые в эту строку копии. Первая копия остаётся
+    на своём месте (лучший ранг), остальные пропадают из списка."""
+    keep, copies, reps = [], {}, []
+    for nid, label, sf, loc, text in items:
+        sh = shingles(code_part(label, sf, text))
+        rep = next((r for r in reps if _is_copy(r[1], r[2], r[3], label, sf, sh)), None)
+        if rep is None:
+            reps.append((nid, label, sf, sh))
+            keep.append(nid)
+        else:
+            copies.setdefault(rep[0], []).append((label, sf, loc))
+    return keep, copies
+
+
 def cluster_pairs(pairs: list[tuple]) -> list[set]:
     """Сгруппировать пары (a_id, b_id, dist, …) в кластеры связности (union-find).
 
@@ -246,6 +297,12 @@ def cluster_pairs(pairs: list[tuple]) -> list[set]:
 
 
 # --- графовые примитивы -----------------------------------------------------------
+
+# Пул соседей векторного индекса. HNSW FalkorDB приближённый, и при малом k он теряет верных
+# соседей кода: на hr при k=64 из точного топ-10 не находилось ни одного (AppendEmptyParagraph),
+# при k≥240 — 9–10 из 10 (замер 2026-10-12, bi/hr/bpm). Цена — ~0.25 с на запрос, как у search.
+POOL = 240
+
 
 def node_embedding(graph, node_id: str):
     """Вектор узла по id (или None). Косинусная дистанция к нему = близость кода."""
@@ -327,13 +384,21 @@ def similar(graph, symbol: str, k: int = 6, threshold: float = 0.10,
     atypes = [r["label"]] if is_type else (own or file_types(graph, r["sf"]))
     out = _filter_near(graph, qvec, r["id"], r["label"], r["sf"], linked, k, kind,
                        anchor_types=atypes, anchor_is_type=is_type)
+    out, copies = _collapse_rows(out)
     dup, near = split_near(out, threshold, k)
     if reranker is not None and dup:
         dup = _rerank_pairs(reranker, node_text(graph, r["id"]) or r["label"], dup)
     # Второй сигнал: Jaccard шинглов anchor↔кандидат — копипаст (высокий) vs семантика (низкий)
     ash = shingles(node_text(graph, r["id"]))
     j = lambda rows: [(*row, jaccard(ash, shingles(row[5]))) for row in rows]
-    return {"resolved": r, "candidates": j(dup), "near": j(near), "kind": kind}
+    return {"resolved": r, "candidates": j(dup), "near": j(near), "kind": kind, "copies": copies}
+
+
+def _collapse_rows(rows):
+    """Свёртка копипаста среди кандидатов (id,label,ft,sf,loc,text,dist) → (rows, copies)."""
+    keep, copies = collapse_copies([(r[0], r[1], r[3], r[4], r[5]) for r in rows])
+    ks = set(keep)
+    return [r for r in rows if r[0] in ks], copies
 
 
 def _filter_near(graph, qvec, self_id, self_label, self_sf, linked, k, kind,
@@ -341,7 +406,7 @@ def _filter_near(graph, qvec, self_id, self_label, self_sf, linked, k, kind,
     """Ближайшие по вектору узлы минус шум: self, прямые связи, usage-фрагменты, generic/
     framework-методы, тот же файл (co-location ≠ клон), пары-семьи, чужой kind. Порог
     дистанции здесь НЕ применяется — его делит split_near."""
-    rows = nearest(graph, qvec, max(k * 8, 40))
+    rows = nearest(graph, qvec, max(k * 30, POOL))
     frag = fragment_ids(graph, rows)               # usage-узлы типа/символа — не дубли
     # метод интерфейса ↔ его реализация, база ↔ override — один контракт, не копипаст
     contract = contract_ids(graph, self_label, anchor_types or [], rows, anchor_is_type)
@@ -392,12 +457,13 @@ def similar_to_text(graph, qvec, anchor: dict, k: int = 6, threshold: float = 0.
     out = _filter_near(graph, qvec, None, anchor["label"], anchor["sf"], set(), k, kind,
                        anchor_types=[anchor["label"]] if is_type else ftypes,
                        anchor_is_type=is_type)
+    out, copies = _collapse_rows(out)
     dup, near = split_near(out, threshold, k)
     if reranker is not None and dup:
         dup = _rerank_pairs(reranker, anchor["text"], dup)
     ash = shingles(anchor["text"])
     j = lambda rows: [(*row, jaccard(ash, shingles(row[5]))) for row in rows]
-    return {"candidates": j(dup), "near": j(near), "kind": kind}
+    return {"candidates": j(dup), "near": j(near), "kind": kind, "copies": copies}
 
 
 def _rerank_pairs(reranker, anchor_text, rows):
@@ -414,10 +480,10 @@ def _rerank_pairs(reranker, anchor_text, rows):
 def _scan_nodes(graph, kind: str, include_framework: bool):
     """Узлы-кандидаты под фильтром kind, без шумовых имён. Кортеж (id,label,ft,sf,loc,text,emb):
     text для Jaccard-шинглов, emb для векторного поиска."""
-    rs = graph.query(
-        "MATCH (n:Entity) WHERE n.embedding IS NOT NULL "
-        "RETURN n.id, n.label, n.file_type, n.source_file, n.source_location, n.text, n.embedding"
-    ).result_set
+    rs = common.query_all(
+        graph, "MATCH (n:Entity) WHERE n.embedding IS NOT NULL "
+        "RETURN n.id, n.label, n.file_type, n.source_file, n.source_location, n.text, n.embedding",
+        order="n.id")
     keep = []
     for nid, label, ft, sf, loc, text, emb in rs:
         if not common.kind_matches(sf, ft, kind):
@@ -433,7 +499,8 @@ def _scan_nodes(graph, kind: str, include_framework: bool):
 
 def _all_linked(graph) -> set:
     """Множество ненаправленных ключей всех прямых LINK-пар графа (для отсева связей)."""
-    rs = graph.query("MATCH (a:Entity)-[:LINK]->(b:Entity) RETURN a.id, b.id").result_set
+    rs = common.query_all(graph, "MATCH (a:Entity)-[:LINK]->(b:Entity) RETURN a.id AS a, b.id AS b",
+                          order="a, b")
     return {pair_key(a, b) for a, b in rs}
 
 
@@ -557,6 +624,14 @@ def _snip(root, sf, loc, cache):
         if root else []
 
 
+def copy_lines(copies, indent: str = "  ") -> list[str]:
+    """Строка о свёрнутых копиях: «×N копипаст: ещё в a.ts:L3, b.ts:L9»."""
+    if not copies:
+        return []
+    where = ", ".join(f"{sf}:{loc}" for _, sf, loc in copies)
+    return [f"{indent}×{len(copies) + 1} копипаст — ещё в: {where}"]
+
+
 def _tag(literal: bool, jacc: float) -> str:
     """Метка природы дубля по Jaccard: буквальный копипаст vs семантически похожий код."""
     return f"копипаст J={jacc:.2f}" if literal else f"семантика J={jacc:.2f}"
@@ -567,6 +642,7 @@ def _similar_body(res: dict, threshold: float, label: str, root) -> list[str]:
     Никогда не говорит «дублей нет»: код→код по эмбеддингу не видит дубль другой формы, поэтому
     пустой/слабый ответ всегда отправляет в find_existing (поиск по назначению словами)."""
     cands, near = res["candidates"], res["near"]
+    copies = res.get("copies") or {}
     out, cache = [], {}
 
     def row(mark, nid, lbl, ft, sf, loc, text, dist, jacc):
@@ -574,6 +650,7 @@ def _similar_body(res: dict, threshold: float, label: str, root) -> list[str]:
         out.append(f"\n  {mark}{dist:.4f}  {tag}{lbl} ({ft})  score {1 - dist:.2f}"
                    f"\n          {sf}:{loc}")
         out.extend(_snip(root, sf, loc, cache))
+        out.extend(copy_lines(copies.get(nid), indent="          "))
     if cands:
         out.append(f"  вероятные дубли (dist≤{threshold}): {len(cands)} — открой и сравни")
         for c in cands:

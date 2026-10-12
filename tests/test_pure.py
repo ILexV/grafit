@@ -279,3 +279,36 @@ def test_contract_ids_member_and_type():
     g = FakeGraph([], owners={"im": "INormService", "x": "Unrelated"})
     assert dupes.contract_ids(g, ".Calc()", ["NormService"], rows) == {"im"}
     assert dupes.contract_ids(g, "NormService", ["NormService"], rows, anchor_is_type=True) == {"im", "it"}
+
+
+# --- обход лимита RESULTSET_SIZE FalkorDB (10000 строк) ---
+
+class _Paged:
+    def __init__(self, n):
+        self.rows = [(i,) for i in range(n)]
+        self.calls = 0
+
+    def query(self, q, params=None):
+        self.calls += 1
+        assert "SKIP $__skip LIMIT $__lim" in q
+        s, l = params["__skip"], params["__lim"]
+        return type("R", (), {"result_set": self.rows[s:s + l]})()
+
+
+def test_query_all_pages_past_resultset_limit(monkeypatch):
+    # FalkorDB молча режет ответ до 10000 строк (bi: 26451 узел → 10000)
+    monkeypatch.setattr(common, "PAGE", 4)
+    g = _Paged(10)
+    assert [r[0] for r in common.query_all(g, "MATCH (n) RETURN n.id", order="n.id")] == list(range(10))
+    assert g.calls == 3
+
+
+def test_rel_map_chunks(monkeypatch):
+    monkeypatch.setattr(common, "PAGE", 2)
+    sizes = []
+
+    class G:
+        def query(self, q, params=None):
+            sizes.append(len(params["ids"]))
+            return type("R", (), {"result_set": [(i, ["calls"]) for i in params["ids"]]})()
+    assert len(nav._rel_map(G(), list("abcde"))) == 5 and sizes == [2, 2, 1]

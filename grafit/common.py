@@ -673,6 +673,24 @@ def connect(host: str, port: int):
     return FalkorDB(host=host, port=port)
 
 
+# FalkorDB обрезает ответ до RESULTSET_SIZE строк (по умолчанию 10000) молча: запрос «все
+# узлы графа» на bi (26 тыс.) отдавал 10000, и глобальный скан дублей видел треть проекта.
+PAGE = 5000
+
+
+def query_all(graph, cypher: str, order: str, params: dict | None = None) -> list:
+    """Все строки запроса постранично (ORDER BY order SKIP/LIMIT) — без обрезки RESULTSET_SIZE.
+    cypher заканчивается на RETURN …; order — выражение стабильного порядка (обычно id узла)."""
+    out, skip = [], 0
+    while True:
+        part = graph.query(f"{cypher} ORDER BY {order} SKIP $__skip LIMIT $__lim",
+                           params={**(params or {}), "__skip": skip, "__lim": PAGE}).result_set
+        out.extend(part)
+        if len(part) < PAGE:
+            return out
+        skip += PAGE
+
+
 def list_graphs(host: str, port: int) -> list[str]:
     db = connect(host, port)
     try:
