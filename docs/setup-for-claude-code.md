@@ -265,6 +265,11 @@ MCP-сервер `grafit mcp` — локальный stdio-процесс, ко�
   (код→код по вектору): кандидаты на общий хелпер/extract-method. Зови перед написанием новой
   функции или выносом общего кода. Отсекает co-location, именные семьи (`XCommand↔XCommandHandler`)
   и graph-связи. `threshold` — макс. косинусная дистанция (0=идентично, дефолт 0.10).
+  `file=путь` без `symbol` — все объявления файла из рабочего дерева, сгруппированные по символу;
+  `base="HEAD"` (или ветка) — только новые/изменённые в diff. Символы без вероятных дублей —
+  одной строкой «проверено N, без вероятных дублей: …» (это не доказательство, что дублей нет).
+  Для конвейера: `git diff --name-only <base>` → один вызов на файл. CLI:
+  `grafit similar --file <путь> [--base HEAD]`.
 - `grafit_dupes(kind, threshold, limit, pairs, rerank)` — глобальный скан копипаста по проекту:
   кластеры near-duplicate символов (`kind=prod`; `pairs=True` — плоский список пар). Каждая
   находка помечена `копипаст` (Jaccard шинглов высок) vs `семантика`, кластеры контрактов —
@@ -319,6 +324,37 @@ grafit hook install          # в корне проекта; повторный 
 > **Документация (LLM-семантика)** в FalkorDB не обновляется хуком автоматически — как и в
 > части I: `/graphify --update` → затем `grafit load`.
 
+## 9a. Хук Claude Code «похоже на существующее» (opt-in, по проекту)
+
+После `Write`/`Edit`/`MultiEdit`, которые добавили **новое** объявление функции/класса/метода
+(TS/JS, C#, Python), хук ищет вероятные дубли в графе проекта (`dist ≤ 0.10`, как у
+`grafit_similar`) и, если нашёл, кладёт в контекст модели короткий блок (≤3 кандидата):
+
+```
+grafit: похоже на существующее — проверь, переиспользуй вместо нового кода:
+formatRubleAmount (frontend/src/utils/money.ts:2):
+  - frontend/src/utils/reportBuilderFormat.ts:64 numberFormatter() (score 0.91)
+Подробнее: grafit_similar(file="frontend/src/utils/money.ts")
+```
+
+Правка тела без нового объявления или отсутствие близких кандидатов — тишина. Хук
+**fail-open**: нет графа проекта, FalkorDB, сервиса `grafit-embed` (модель локально хук не
+грузит — слишком долго) или вышел бюджет ~3 с (`GRAFIT_HOOK_BUDGET`) — выход 0 без вывода,
+правка никогда не блокируется. Эмбеддинг ≈1 с на объявление, поэтому за правку проверяются
+первые ≤3 новых объявления. Срабатывания пишутся в `~/.grafit/usage.jsonl`
+(`tool: claude_hook`, `fired`, `n` — показано кандидатов, `ms`).
+
+```bash
+grafit hook install --claude [путь]     # в .claude/settings.local.json проекта (не в git)
+grafit hook uninstall --claude [путь]   # снять (или: grafit hook install --claude --uninstall)
+```
+
+Установка идемпотентна и не трогает чужие хуки/настройки: в `hooks.PostToolUse` добавляется
+одна запись `{"matcher": "Write|Edit|MultiEdit", "hooks": [{"type": "command", "command":
+"<grafit> claude-hook", "timeout": 5}]}`. Действует с новой сессии Claude Code. Копия или
+worktree проекта под другим именем каталога: задай граф оригинала `GRAFIT_GRAPH=<граф>`
+(например, в `env` того же settings.local.json).
+
 ## 10. Фиксация версии модели (детерминизм векторов)
 
 Вектора зависят не от имени модели, а от **версии fastembed** (пример: e5-large сменил
@@ -343,6 +379,7 @@ grafit (часть II):
 [ ] grafit up  (FalkorDB :6399 + grafit-embed :6401; первый раз собирает образ)
 [ ] grafit load  (из корня проекта; grafit list — проект виден)
 [ ] MCP в .mcp.json: { "grafit": { "command": "grafit", "args": ["mcp"] } }
+[ ] (опц.) grafit hook install --claude  — подсказки «похоже на существующее» после Write/Edit
 [ ] grafit-блок в post-commit ПОСЛЕ graphify-блока (+ .git/info/exclude)
 [ ] (опц.) docs-флоу: graphify update . → grafit load для семантики доков
 ```

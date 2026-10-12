@@ -134,10 +134,20 @@ def _refresh(args):
 def _hook(args):
     from . import refresh
     root = Path(args.path) if args.path else None
+    uninstall = args.action == "uninstall" or args.uninstall
     try:
-        print("\n".join(refresh.hook_install(root, uninstall=args.action == "uninstall")))
+        if args.claude:
+            from . import claude_hook
+            print("\n".join(claude_hook.install(root, uninstall=uninstall)))
+            return
+        print("\n".join(refresh.hook_install(root, uninstall=uninstall)))
     except ValueError as ex:
         sys.exit(f"grafit hook: {ex}")
+
+
+def _claude_hook(args):
+    from . import claude_hook
+    sys.exit(claude_hook.main())
 
 
 def _list(args):
@@ -349,10 +359,18 @@ def main():
     p.add_argument("--threads", type=int, default=4)
     p.set_defaults(fn=_refresh)
 
-    p = sub.add_parser("hook", help="post-commit хук: фоновый grafit refresh после graphify-блока")
+    p = sub.add_parser("hook", help="post-commit хук (фоновый grafit refresh) или --claude: "
+                                     "хук Claude Code «похоже на существующее»")
     p.add_argument("action", choices=["install", "uninstall"])
     p.add_argument("path", nargs="?", default=None, help="корень проекта (по умолч. cwd)")
+    p.add_argument("--claude", action="store_true",
+                   help="PostToolUse-хук Claude Code в .claude/settings.local.json проекта")
+    p.add_argument("--uninstall", action="store_true", help="снять хук (= action uninstall)")
     p.set_defaults(fn=_hook)
+
+    p = sub.add_parser("claude-hook", help="(вызывает Claude Code) PostToolUse: дубли новых "
+                                            "объявлений; stdin — JSON события")
+    p.set_defaults(fn=_claude_hook)
 
     p = sub.add_parser("list", help="графы проектов"); p.set_defaults(fn=_list)
 
