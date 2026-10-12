@@ -231,6 +231,18 @@ def become_active_loader(name: str) -> bool:
     return True
 
 
+def release_project_lock() -> None:
+    """Отпустить замок активного загрузчика проекта (иначе он держится до выхода процесса:
+    `refresh --all-stale` держал бы замок уже залитого проекта, пока идёт следующий)."""
+    global _PROJECT_LOCK_FD
+    if _PROJECT_LOCK_FD is not None:
+        try:
+            _PROJECT_LOCK_FD.close()
+        except Exception:
+            pass
+        _PROJECT_LOCK_FD = None
+
+
 def _rerun_path(name: str) -> Path:
     return HOME / f"load.{sanitize(name)}.rerun"
 
@@ -304,19 +316,54 @@ CODE_EXTENSIONS = {
 }
 
 
-def load_ignore_patterns(root) -> list[str]:
-    """Шаблоны .graphifyignore корня проекта (как graphify: нет файла — берём .gitignore)."""
+def parse_ignore_line(raw: str) -> str:
+    """Строка .graphifyignore → шаблон, как у graphify (detect._parse_gitignore_line): срезает
+    инлайн-комментарий ` # …` (решётка после пробела), `\\#` → `#`, хвостовые пробелы. Без
+    этого `.scratch/   # черновики` не совпадал ни с чем, и каталог «игнорировался» только для
+    graphify, но не для grafit."""
+    line = raw.rstrip("\n\r").lstrip()
+    if not line or line.startswith("#"):
+        return ""
+    line = re.sub(r"\s+#+[^\\].*$", "", line)
+    line = line.replace("\\#", "#")
+    return re.sub(r"(?<!\\) +$", "", line)
+
+
+# Каталоги, которые grafit не заливает ни в одном проекте: черновики и состояние агентских
+# конвейеров (.scratch/ — тикеты/спеки, .autopilot/ — state.js, bundle.json, sql). Узлы оттуда
+# вытесняют продуктовый код из выдачи. Идут ПЕРЕД шаблонами проекта, поэтому `!.scratch/`
+# в .graphifyignore возвращает каталог. GRAFIT_DEFAULT_IGNORE — свой список через запятую
+# (пустая строка — без умолчаний).
+DEFAULT_IGNORE = (".scratch/", ".autopilot/")
+
+
+def default_ignore() -> list[str]:
+    env = os.environ.get("GRAFIT_DEFAULT_IGNORE")
+    if env is None:
+        return list(DEFAULT_IGNORE)
+    return [p.strip() for p in env.split(",") if p.strip()]
+
+
+def load_ignore_patterns(root, defaults: bool = True) -> list[str]:
+    """Шаблоны игнора проекта: умолчания grafit + .graphifyignore корня (как graphify: нет
+    файла — берём .gitignore). defaults=False — только то, что видит сам graphify."""
     root = Path(root)
+    out = default_ignore() if defaults else []
     for fn in (".graphifyignore", ".gitignore"):
         p = root / fn
         if p.exists():
-            out = []
             for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-                line = raw.strip()
-                if line and not line.startswith("#"):
+                line = parse_ignore_line(raw)
+                if line:
                     out.append(line)
-            return out
-    return []
+            break
+    return out
+
+
+def ignore_sha(patterns: list[str]) -> str:
+    """Отпечаток набора шаблонов игнора: сменился — граф надо перезалить (узлы отфильтруются
+    заново), даже если graph.json тот же."""
+    return hashlib.sha1("\n".join(patterns).encode("utf-8")).hexdigest()[:16]
 
 
 def _ignore_match(rel: str, pat: str) -> bool:
@@ -355,6 +402,15 @@ def is_ignored(rel: str, patterns: list[str]) -> bool:
         if _ignore_match(rel, pat[1:] if neg else pat):
             hit = not neg
     return hit
+
+
+def node_ignored(root, sf: str | None, patterns: list[str]) -> bool:
+    """Узел из файла под игнором? source_file в graph.json относительный (или абсолютный внутри
+    корня). Узлы без файла (концепты, внешние пакеты) не трогаем."""
+    if not sf or not patterns:
+        return False
+    rel = os.path.relpath(sf, root) if os.path.isabs(sf) else sf
+    return not rel.startswith("..") and is_ignored(rel, patterns)
 
 
 def is_graph_code(rel: str, patterns: list[str]) -> bool:

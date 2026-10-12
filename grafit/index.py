@@ -28,6 +28,20 @@ def ensure_graph_json(project: Path, build: bool) -> Path:
              f"(или `grafit load --build`, если graphify установлен: uv tool install graphifyy).")
 
 
+def drop_ignored(root, nodes, links, patterns):
+    """Отбросить узлы из файлов под игнором и рёбра к ним → (nodes, links, сколько выкинуто).
+
+    graphify при `update` пересобирает только код: doc-узлы (.md из LLM-извлечения) каталога,
+    который позже добавили в .graphifyignore, остаются в graph.json навсегда (hr: 247 узлов
+    .scratch/*.md). Фильтр на заливке убирает их из FalkorDB без полной пересборки graphify."""
+    keep = [n for n in nodes if not common.node_ignored(root, n.get("source_file"), patterns)]
+    if len(keep) == len(nodes):
+        return nodes, links, 0
+    ids = {n["id"] for n in keep}
+    links = [l for l in links if l.get("source") in ids and l.get("target") in ids]
+    return keep, links, len(nodes) - len(keep)
+
+
 def index_project(project=None, graph=None, host="localhost", port=6399, model=None,
                   no_snippets=False, no_cache=False, threads=4, batch=16, build=False, force=False):
     root = common.project_root(Path(project) if project else None)
@@ -39,8 +53,11 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
     # PYTHONHASHSEED=0, одинаковый код → тот же файл). Per-project coalescing rerun-цикла держит
     # вызывающий `_load` (become_active_loader), здесь конкуренции этого графа уже нет.
     gsha = common.file_sha(gj)
+    pats = common.load_ignore_patterns(root)
+    isha = common.ignore_sha(pats)
+    prev = common.load_meta().get(name) or {}
     if not no_cache and not build and not force \
-            and (common.load_meta().get(name) or {}).get("graph_sha") == gsha:
+            and prev.get("graph_sha") == gsha and prev.get("ignore_sha") == isha:
         common.log(f"✓ граф '{name}': graph.json не изменился с прошлой заливки — пропуск (--force чтобы перезалить).")
         return {"graph": name, "skipped": True, "graph_sha": gsha}
 
@@ -49,8 +66,10 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
     common.acquire_load_lock()
 
     g = json.loads(gj.read_text(encoding="utf-8"))
-    nodes = g["nodes"]
-    links = g.get("links") or g.get("edges") or []
+    nodes, links, dropped = drop_ignored(root, g["nodes"], g.get("links") or g.get("edges") or [], pats)
+    if dropped:
+        common.log(f"пропущено узлов из игнорируемых файлов (.graphifyignore + умолчания "
+                   f"{', '.join(common.default_ignore()) or '—'}): {dropped}")
     labels_p = root / "graphify-out" / ".graphify_labels.json"
     comm_labels = json.loads(labels_p.read_text(encoding="utf-8")) if labels_p.exists() else {}
     common.log(f"проект: {root}\nграф FalkorDB: '{name}'  ({len(nodes)} узлов, {len(links)} рёбер)")
@@ -191,7 +210,8 @@ def index_project(project=None, graph=None, host="localhost", port=6399, model=N
     common.save_meta(name, commit=gi.get("commit"), short=gi.get("short"),
                      committed_at=gi.get("committed_at"), branch=gi.get("branch"),
                      dirty_at_build=gi.get("dirty"), built_at=common.now_iso(),
-                     root=str(root), nodes=cnt, edges=rel, model=model_name, graph_sha=gsha)
+                     root=str(root), nodes=cnt, edges=rel, model=model_name, graph_sha=gsha,
+                     ignore_sha=isha)
     if gi.get("dirty"):
         common.log("⚠ рабочее дерево грязное — граф отражает закоммиченное + несохранённые правки на диске")
 

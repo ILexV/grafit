@@ -5,7 +5,7 @@
 («ровно один догоняющий проход на проект») и глобальный семафор заливок (GRAFIT_MAX_LOADS).
 """
 from __future__ import annotations
-import json, os, re, shutil, subprocess, sys, time
+import os, re, shutil, subprocess, sys, time
 from pathlib import Path
 
 from . import common
@@ -19,45 +19,48 @@ def _stamp() -> str:
 
 # --- заливка с coalescing (общая для `grafit load` и refresh) ---
 
-def load_coalesced(name: str, already_active: bool = False, **index_kw) -> bool:
+def load_coalesced(name: str, prepare=None, **index_kw) -> bool:
     """`grafit load` с «ровно одним отложенным проходом на проект»: если заливка этого графа
     уже идёт — не плодим второй процесс и не убиваем активный, лишь помечаем rerun (False).
-    Активный загрузчик после своего прохода видит пометку и делает ОДИН догоняющий проход."""
+    Активный загрузчик после своего прохода видит пометку и делает догоняющий проход.
+
+    Пометку ставим ДО попытки взять замок, а активный проверяет её ПОСЛЕ того, как отпустил
+    замок: иначе триггер, пришедший в миг между «пометок нет» и выходом активного, терялся
+    (dwh 12.10 — повтор ушёл в rerun, который никто не подхватил). prepare() — перед каждым
+    проходом (refresh: graphify update, если код новее graph.json), иначе догоняющий проход
+    заливал бы тот же graph.json и пропускался."""
     from . import index
-    if not already_active and not common.become_active_loader(name):
-        common.request_rerun(name)
+    common.request_rerun(name)
+    if not common.become_active_loader(name):
         log(f"[grafit] заливка '{name}' уже идёт — отложен один повторный проход (rerun)")
         return False
     while True:
         common.take_rerun(name)          # снимаем pending: грузим текущее состояние графа
-        index.index_project(graph=name, **index_kw)
-        common.release_load_lock()       # отпускаем глобальный слот — даём ход другим проектам
-        if not common.rerun_pending(name):
-            return True
-        log(f"[grafit] во время заливки '{name}' пришли изменения — ещё один проход")
+        try:
+            if prepare:
+                prepare()
+            index.index_project(graph=name, **index_kw)
+        finally:
+            common.release_load_lock()   # отпускаем глобальный слот — даём ход другим проектам
+        if common.rerun_pending(name):
+            log(f"[grafit] во время заливки '{name}' пришли изменения — ещё один проход")
+            continue
+        common.release_project_lock()
+        if not common.rerun_pending(name) or not common.become_active_loader(name):
+            return True                  # пометки нет / её подхватил другой активный загрузчик
+        log(f"[grafit] '{name}': изменения пришли при отпускании замка — ещё один проход")
 
 
 # --- что нужно обновить ---
 
-def ignored_in_graph(root: Path, gj: Path) -> list[str]:
-    """Файлы КОДА, чьи узлы есть в graph.json, хотя файл уже под .graphifyignore: инкрементальная
-    пересборка graphify их не убирает — нужна полная (graphify update --force). Доки не в счёт:
-    их узлы из LLM-извлечения, `graphify update` их не пересобирает (вечный --force впустую)."""
-    pats = common.load_ignore_patterns(root)
-    if not pats or not gj.exists():
-        return []
-    try:
-        nodes = json.loads(gj.read_text(encoding="utf-8")).get("nodes") or []
-    except Exception:
-        return []
-    files = {n.get("source_file") for n in nodes if n.get("source_file")}
-    out = []
-    for sf in files:
-        rel = os.path.relpath(sf, root) if os.path.isabs(sf) else sf
-        if (not rel.startswith("..") and Path(rel).suffix in common.CODE_EXTENSIONS
-                and common.is_ignored(rel, pats)):
-            out.append(rel)
-    return sorted(out)
+def ignore_changed(name: str, root: Path) -> bool:
+    """Шаблоны игнора (.graphifyignore + умолчания grafit) сменились с прошлой заливки — граф
+    надо перезалить: узлы из игнорируемых файлов отбрасывает load (index.drop_ignored), полная
+    пересборка graphify для этого не нужна. Граф, залитый до учёта игнора, тоже сюда попадает."""
+    m = common.load_meta().get(name)
+    if not m:
+        return False
+    return m.get("ignore_sha") != common.ignore_sha(common.load_ignore_patterns(root))
 
 
 def graph_json_outdated(root: Path, gj: Path, code_changed: list[str] | None) -> bool:
@@ -98,16 +101,90 @@ def wait_graph_rebuild(gj: Path, base: float, timeout: float, settle: float = 6.
     return False
 
 
+# Каталоги, которые незачем обходить в поиске невалидных имён (тяжёлые и не код проекта).
+_WALK_SKIP = {b".git", b"node_modules", b"bin", b"obj", b"dist", b"graphify-out", b".venv"}
+
+
+def non_utf8_paths(root: Path, limit: int = 50) -> list[bytes]:
+    """Пути (относительно root, байтами), чьё имя — невалидный UTF-8 (имя обрезано посреди
+    кириллической буквы: '\\udcd1' после декодирования). graphify на таком пути падает целиком
+    ('surrogates not allowed') и оставляет needs_update — bi, .scratch/…/out-q/*.json."""
+    out = []
+    for dp, dns, fns in os.walk(bytes(root)):
+        dns[:] = [d for d in dns if d not in _WALK_SKIP]
+        for n in dns + fns:
+            try:
+                n.decode("utf-8")
+            except UnicodeDecodeError:
+                out.append(os.path.relpath(os.path.join(dp, n), bytes(root)))
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+# Обёртка запуска graphify его же интерпретатором: detect() без файлов с невалидным UTF-8 в
+# пути. `graphify update` не принимает --exclude, а править .graphifyignore проекта grafit не
+# должен. Если внутренности graphify сменятся (нет detect) — запускаемся как есть.
+_SKIP_BAD_PATHS = """\
+import sys
+try:
+    import graphify.detect as _d
+    _orig = _d.detect
+    def _detect(*a, **k):
+        r = _orig(*a, **k)
+        for kind, fs in (r.get("files") or {}).items():
+            keep = []
+            for f in fs:
+                try:
+                    str(f).encode("utf-8")
+                    keep.append(f)
+                except UnicodeEncodeError:
+                    print("[grafit] пропуск файла с невалидным UTF-8 в имени: %r" % (f,), file=sys.stderr)
+            r["files"][kind] = keep
+        return r
+    _d.detect = _detect
+except Exception as ex:
+    print("[grafit] обёртка graphify не применена: %r" % (ex,), file=sys.stderr)
+from graphify.__main__ import main
+sys.argv = ["graphify"] + sys.argv[1:]
+main()
+"""
+
+
+def _graphify_python(exe: str) -> str | None:
+    """Интерпретатор, которым запущен graphify (из shebang его скрипта), или None."""
+    try:
+        with open(exe, "rb") as f:
+            first = f.readline().decode("utf-8", "replace").strip()
+    except OSError:
+        return None
+    py = first[2:].strip().split()[0] if first.startswith("#!") and first[2:].strip() else ""
+    return py if "python" in os.path.basename(py) and os.path.exists(py) else None
+
+
 def graphify_update(root: Path, force: bool = False, no_cluster: bool = False) -> bool:
     """`graphify update .` — пере-экстракция КОДА без LLM. PYTHONHASHSEED=0 — детерминированная
-    кластеризация (как в graphify-хуке), иначе метки сообществ «плавают» от прогона к прогону."""
+    кластеризация (как в graphify-хуке), иначе метки сообществ «плавают» от прогона к прогону.
+    Файлы с невалидным UTF-8 в имени пропускаются с предупреждением, а не роняют всю сборку."""
     exe = shutil.which("graphify")
     if not exe:
         log("[grafit refresh] graphify не найден в PATH — пропускаю пересборку graph.json")
         return False
-    cmd = [exe, "update", "."] + (["--force"] if force else []) + (["--no-cluster"] if no_cluster else [])
+    args = ["update", "."] + (["--force"] if force else []) + (["--no-cluster"] if no_cluster else [])
+    cmd = [exe] + args
+    bad = non_utf8_paths(Path(root))
+    if bad:
+        shown = ", ".join(b.decode("utf-8", "replace") for b in bad[:5])
+        log(f"[grafit refresh] ⚠ {len(bad)}{'+' if len(bad) >= 50 else ''} путей с невалидным UTF-8 "
+            f"в имени — graphify пропустит их ({shown}{' …' if len(bad) > 5 else ''}); "
+            f"переименуй или добавь в .graphifyignore")
+        py = _graphify_python(exe)
+        if py:
+            cmd = [py, "-c", _SKIP_BAD_PATHS] + args
+        else:
+            log("[grafit refresh] интерпретатор graphify не найден — запускаю как есть (может упасть)")
     env = {**os.environ, "PYTHONHASHSEED": "0"}
-    log(f"[grafit refresh] {root}: {' '.join(cmd[1:])}")
+    log(f"[grafit refresh] {root}: {' '.join(args)}")
     r = subprocess.run(cmd, cwd=str(root), env=env)
     if r.returncode != 0:
         log(f"[grafit refresh] graphify update завершился с кодом {r.returncode}")
@@ -118,8 +195,8 @@ def plan(name: str, root: Path, min_commits: int = 1) -> dict:
     """Нужно ли обновлять граф проекта и как: {stale, why, graphify, force, f}."""
     f = common.graph_freshness(name, root)
     gj = root / "graphify-out" / "graph.json"
-    ign = ignored_in_graph(root, gj)
-    stale = common.is_stale(f, min_commits) or bool(ign) or f.get("reason") == "no_meta"
+    ign = ignore_changed(name, root)
+    stale = common.is_stale(f, min_commits) or ign or f.get("reason") == "no_meta"
     code = f.get("code_changed")
     why = []
     if f.get("reason") == "no_meta":
@@ -129,9 +206,9 @@ def plan(name: str, root: Path, min_commits: int = 1) -> dict:
     elif code is None and f["state"] not in ("fresh", "unknown"):
         why.append(f"состояние {f['state']}, список изменений недоступен")
     if ign:
-        why.append(f"в графе узлы из игнорируемых файлов: {len(ign)} (нужна полная пересборка)")
+        why.append("сменились шаблоны игнора — перезалить без узлов из игнорируемых файлов")
     return {"stale": stale, "why": "; ".join(why) or "актуален", "f": f, "ignored": ign,
-            "graphify": bool(ign) or graph_json_outdated(root, gj, code), "force": bool(ign)}
+            "graphify": graph_json_outdated(root, gj, code), "force": False}
 
 
 def refresh_project(root: Path, *, min_commits: int = 1, after_hook: bool = False,
@@ -159,17 +236,20 @@ def refresh_project(root: Path, *, min_commits: int = 1, after_hook: bool = Fals
             log(f"[grafit refresh] {name}: graph.json не пересобран за {int(wait_timeout)}s — заливаю как есть")
     kw = {"project": str(root), "host": "localhost", "port": 6399}
     kw.update(index_kw or {})
-    if after_hook or not p["graphify"] or skip_graphify:
-        done = load_coalesced(name, **kw)
-    else:
+    prepare = None
+    if not (after_hook or skip_graphify):
         # graphify update — под тем же замком проекта, что и load: два refresh одного проекта
-        # (несколько чатов стартовали MCP) не пишут graph.json одновременно
-        if not common.become_active_loader(name):
-            common.request_rerun(name)
-            return f"{name}: обновление уже идёт — поставлен rerun ({p['why']})"
-        graphify_update(root, force=p["force"])
-        done = load_coalesced(name, already_active=True, **kw)
-    return f"{name}: {'залит' if done else 'заливка уже идёт — поставлен rerun'} ({p['why']})"
+        # (несколько чатов стартовали MCP) не пишут graph.json одновременно. Перед КАЖДЫМ
+        # проходом, в т.ч. догоняющим: код, закоммиченный во время заливки, иначе не попадёт.
+        first = [p["graphify"]]
+
+        def prepare():
+            need = first.pop() if first else graph_json_outdated(
+                root, gj, common.graph_freshness(name, root).get("code_changed"))
+            if need:
+                graphify_update(root, force=p["force"])
+    done = load_coalesced(name, prepare=prepare, **kw)
+    return f"{name}: {'залит' if done else 'обновление уже идёт — поставлен rerun'} ({p['why']})"
 
 
 # --- фоновый refresh при старте MCP-сервера ---
