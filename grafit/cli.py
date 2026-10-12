@@ -1,6 +1,6 @@
-"""grafit CLI: up | down | load | refresh | hook | query | similar | dupes | eval | list | mcp."""
+"""grafit CLI: up | down | load | refresh | hook | query | similar | dupes | eval | bench | list | mcp."""
 from __future__ import annotations
-import argparse, os, shutil, subprocess, sys
+import argparse, json, os, shutil, subprocess, sys
 from pathlib import Path
 
 from . import common
@@ -275,6 +275,15 @@ def _eval(args):
                 port=args.port, threads=args.threads)
 
 
+def _bench(args):
+    from . import bench
+    res = bench.run(path=args.bench, graphs=args.graphs.split(",") if args.graphs else None,
+                    host=args.host, port=args.port, threads=args.threads, log=common.log)
+    print(bench.format_table(res))
+    if args.json:
+        Path(args.json).write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
 def _mcp(args):
     from . import mcp_server
     mcp_server.main()
@@ -394,6 +403,13 @@ def main():
     p.add_argument("--graph", default=None); p.add_argument("--golden", default=None)
     p.add_argument("--threads", type=int, default=4)
     p.set_defaults(fn=_eval)
+
+    p = sub.add_parser("bench", help="антидубли: recall@k find_existing/similar на эталоне пар")
+    p.add_argument("--bench", default=None, help="файл эталона (по умолч. grafit/data/dupes_bench.json)")
+    p.add_argument("--graphs", default=None, help="только эти графы, через запятую")
+    p.add_argument("--json", default=None, help="сохранить сырые ранги в файл")
+    p.add_argument("--threads", type=int, default=4)
+    p.set_defaults(fn=_bench)
 
     p = sub.add_parser("mcp", help="запустить MCP-сервер (stdio)"); p.set_defaults(fn=_mcp)
 
