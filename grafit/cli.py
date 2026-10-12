@@ -187,13 +187,16 @@ def _query(args):
     if not rows:
         print(f"{fresh}\n[{name}] {args.question}\nпо фильтру --kind {args.kind} ничего: все "
               f"{res['filtered_out']} ближайших узлов — другого вида; повтори с --kind all"); return
-    quality = search.match_quality(res["best_dist"])
+    quality = search.match_quality(res["best_dist"], res.get("bg_dist"))
     if quality == "none":
         print(f"{fresh}\n[{name}] {args.question}\nничего похожего (лучший score "
-              f"{1 - res['best_dist']:.3f} < {1 - search.NONE_DIST:.3f}) — такого кода, вероятно, нет"); return
+              f"{1 - res['best_dist']:.3f} < {1 - search.NONE_DIST:.3f}) — по этой формулировке не "
+              f"найдено; переформулируй, это не гарантия, что кода нет"); return
     mode = ("гибрид" if args.hybrid else "вектор") + (f"+реранк:{rname}" if reranker else "")
     mode += f", kind={args.kind}" if args.kind != "all" else ""
     best = "" if res["best_dist"] is None else f", лучший score {1 - res['best_dist']:.2f}"
+    if res["best_dist"] is not None and res.get("bg_dist") is not None:
+        best += f", отрыв от фона {res['bg_dist'] - res['best_dist']:.3f}"
     mode += f", совпадение: {'сильное' if quality == 'strong' else 'слабое — проверь'}{best}"
     print(f"{fresh}\n[{name}] {args.question}   ({mode})\n{'=' * 70}")
     root = common.project_root() if args.snippet else None
@@ -363,8 +366,9 @@ def main():
     p.add_argument("symbol"); p.add_argument("--graph", default=None)
     p.add_argument("-k", type=int, default=6)
     p.add_argument("--threshold", type=float, default=0.10, help="макс. косинусная дистанция (0=идентично)")
-    p.add_argument("--kind", choices=["all", "code", "tests", "docs", "prod", "frontend", "backend"],
-                   default="all")
+    p.add_argument("--kind", choices=["auto", "all", "code", "tests", "docs", "prod", "frontend",
+                                      "backend"], default="auto",
+                   help="auto: prod для продуктового символа, tests — для теста")
     p.add_argument("--snippet", action="store_true", help="строки исходника у кандидатов")
     p.add_argument("--rerank", action="store_true", help="кросс-энкодер вторым проходом")
     p.add_argument("--threads", type=int, default=4)

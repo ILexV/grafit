@@ -20,6 +20,11 @@ class FakeGraph:
 
     def query(self, q, params=None):
         params = params or {}
+        if "vector.queryNodes" in q and "k" in params:   # dupes.nearest: (id,label,ft,sf,loc,text,dist)
+            return _RS([(nid, label, ft, sf, loc, f"{label} text", dist)
+                        for nid, label, ft, sf, loc, dist in self.nodes[:params["k"]]])
+        if "m.source_file = $sf" in q:                    # dupes.file_types — типы файла
+            return _RS([])
         if "vector.queryNodes" in q:
             self.vec_calls.append(params["cand"])
             rows = [(nid, label, ft, sf, loc, "", f"{label} text", dist)

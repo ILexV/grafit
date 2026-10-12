@@ -843,6 +843,13 @@ def relation_kind(rel: str | None) -> str:
 _NONPROD_PARTS = ("migrations", "obj", "bin", "node_modules", "dist", "__generated__")
 
 
+def is_service_path(sf: str | None) -> bool:
+    """Служебный, не продуктовый код: каталог с точкой в пути — агентские конвейеры и хуки
+    (.claude/, .opencode/, .autopilot/), черновики (.scratch/), CI (.github/). В kind=prod
+    их узлы — фон: в поиске «есть ли уже такое» они перебивают продуктовый код по score."""
+    return any(p.startswith(".") and p not in (".", "..") for p in (sf or "").split("/")[:-1])
+
+
 # Слой узла по расширению (сильнее каталога — язык однозначнее имени папки),
 # с фолбэком на сегмент пути для неоднозначных случаев.
 _FRONT_EXT = {"tsx", "jsx", "ts", "js", "mjs", "cjs", "vue", "svelte",
@@ -888,7 +895,7 @@ def kind_matches(sf: str | None, ft: str | None, kind: str) -> bool:
         if (ft or "") != "code" or is_test:
             return False
         s = (sf or "").lower()
-        if ".generated." in s:
+        if ".generated." in s or is_service_path(s):
             return False
         return not any(p in s.split("/") for p in _NONPROD_PARTS)
     return True

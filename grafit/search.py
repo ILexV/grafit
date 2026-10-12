@@ -60,15 +60,31 @@ def _lexical(graph, question, cand):
 # погода, набор букв) ~0.21–0.25. e5 сжимает шкалу, поэтому пороги узкие. Переопределяются env.
 STRONG_DIST = float(os.environ.get("GRAFIT_STRONG_DIST", "0.175"))
 NONE_DIST = float(os.environ.get("GRAFIT_NONE_DIST", "0.20"))
+# «Сильное» требует ещё и ОТРЫВА лучшего от фона (медиана дистанций ближайших BG_POOL узлов
+# того же kind): e5 сжимает шкалу, и случайный узел (Props, VALID_TABS) легко набирает 0.83.
+# Калибровка на bi/hr/bpm (2026-10-12, 34 запроса): верный топ — отрыв 0.014–0.052, случайный
+# топ (Props, VALID_TABS, From) — 0.008–0.0128; «ни о чём» отсекает абсолютный порог.
+STRONG_GAP = float(os.environ.get("GRAFIT_STRONG_GAP", "0.013"))
+BG_POOL = 40
 
 
-def match_quality(dist) -> str:
-    """strong | weak | none — насколько лучший результат похож на запрос (по дистанции)."""
+def match_quality(dist, bg=None) -> str:
+    """strong | weak | none — насколько лучший результат похож на запрос (по дистанции).
+    bg — фон (медиана дистанций соседей): без отрыва от него совпадение не «сильное»."""
     if dist is None:
         return "weak"
-    if dist <= STRONG_DIST:
+    if dist <= STRONG_DIST and (bg is None or bg - dist >= STRONG_GAP):
         return "strong"
     return "weak" if dist < NONE_DIST else "none"
+
+
+def background(dists) -> float | None:
+    """Фон выдачи: медиана дистанций ближайших BG_POOL кандидатов (None — мало данных)."""
+    ds = sorted(d for d in dists if d is not None)[:BG_POOL]
+    if len(ds) < 10:
+        return None
+    m = len(ds) // 2
+    return ds[m] if len(ds) % 2 else (ds[m - 1] + ds[m]) / 2
 
 
 def search(graph, qvec, question, **kw):
@@ -88,7 +104,7 @@ def search_ex(graph, qvec, question, k=8, cand=60, test_penalty=0.5,
     collapse: файл-узел уступает место самому конкретному узлу того же файла (класс/метод), а из
     пары интерфейс↔реализация (тип или одноимённый член) остаётся реализация — contracts[id] =
     (label, sf) свёрнутого контракта.
-    → {"rows", "filtered_out", "candidates", "best_dist", "contracts"}"""
+    → {"rows", "filtered_out", "candidates", "best_dist", "bg_dist", "contracts"}"""
     # при фильтре/дедупе берём больше кандидатов — иначе они «съедят» top-k
     if _vcand:
         vcand = _vcand
@@ -100,7 +116,8 @@ def search_ex(graph, qvec, question, k=8, cand=60, test_penalty=0.5,
         vcand = cand
     vec_rows = graph.query(_VEC_Q, params={"cand": vcand, "q": qvec}).result_set
     lex_rows = _lexical(graph, question, vcand) if hybrid else []
-    empty = {"rows": [], "filtered_out": 0, "candidates": 0, "best_dist": None, "contracts": {}}
+    empty = {"rows": [], "filtered_out": 0, "candidates": 0, "best_dist": None, "bg_dist": None,
+             "contracts": {}}
     if not vec_rows and not lex_rows:
         return empty
 
@@ -132,7 +149,9 @@ def search_ex(graph, qvec, question, k=8, cand=60, test_penalty=0.5,
     order = sorted(idset, key=lambda nid: demote(nid, rrf.get(nid, 0.0)), reverse=True)
 
     if hide_fragments or dedupe:
-        order = _prune(graph, order, by_id, k * 4, dedupe, hide_fragments)
+        order = _prune(graph, order, by_id, max(k * 4, BG_POOL), dedupe, hide_fragments)
+    # фон — по очищенному списку: дубли одной строки и фрагменты тянули бы медиану к топу
+    bg = background(vdist.get(nid) for nid in order)
     contracts: dict = {}
     if collapse:
         order = _collapse_files(order, by_id)
@@ -158,6 +177,7 @@ def search_ex(graph, qvec, question, k=8, cand=60, test_penalty=0.5,
     dists = [d for d in (vdist.get(nid) for nid in order) if d is not None]
     return {"rows": rows, "filtered_out": len(by_id) - len(idset), "candidates": len(by_id),
             "best_dist": min(dists) if dists else None,
+            "bg_dist": bg,
             "contracts": {nid: c for nid, c in contracts.items() if nid in set(order[:k])}}
 
 

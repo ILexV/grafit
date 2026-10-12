@@ -199,9 +199,12 @@ RU/EN, опечатки, другое название).
   «где проверяется доступ к филиалу» → классы/методы с path:line. grep — для известной строки.
 • Перед правкой/удалением символа — grafit_impact (кто использует, в т.ч. непрямо) и
   grafit_tests (какие тесты заденет).
-• Написал новый символ — grafit_similar(symbol, file=путь): не дублирует ли он старый код.
+• Написал новый символ — grafit_similar(symbol, file=путь) И grafit_find_existing(«что он делает»):
+  similar сравнивает форму кода и не видит дубль, написанный иначе; find_existing ищет по назначению.
 
-score — близость 0..1: сильное / слабое (проверь) / «ничего похожего» (значит, такого кода нет).
+score — близость 0..1, шкала сжата (0.80–0.87 бывает и у случайных узлов). «Сильное» — лучший
+кандидат выделяется из фона; «слабое» — кандидаты не выделяются, проверь их чтением.
+Пустой или слабый ответ НЕ доказывает, что такого кода нет: переформулируй, зови второй инструмент.
 Шапка ответа — свежесть графа: файлы, изменённые после сборки, помечены «изменён после
 сборки» (перепроверь их в файле); результаты из неизменённых файлов надёжны.
 """
@@ -220,18 +223,25 @@ def _score(dist) -> str:
     return "score —" if dist is None else f"score {1 - dist:.2f}"
 
 
-_Q_TEXT = {"strong": "сильное", "weak": "слабое — проверь", "none": "ничего похожего"}
+_Q_TEXT = {"strong": "сильное", "weak": "слабое — кандидаты не выделяются из фона, проверь каждый",
+           "none": "ничего похожего"}
+
+
+def _quality(res: dict) -> str:
+    return search.match_quality(res["best_dist"], res.get("bg_dist"))
 
 
 def _verdict(res: dict) -> str:
-    q = search.match_quality(res["best_dist"])
+    q = _quality(res)
     best = "" if res["best_dist"] is None else f", лучший score {1 - res['best_dist']:.2f}"
+    if res["best_dist"] is not None and res.get("bg_dist") is not None:
+        best += f", отрыв от фона {res['bg_dist'] - res['best_dist']:.3f}"
     return f"совпадение: {_Q_TEXT[q]}{best}"
 
 
 def _empty_answer(fr, name, question, kind, res) -> str | None:
     """Честный пустой ответ: фильтр kind отсёк всё / ничего похожего / граф пуст."""
-    if res["rows"] and search.match_quality(res["best_dist"]) != "none":
+    if res["rows"] and _quality(res) != "none":
         return None
     if not res["candidates"]:
         return f"{fr.line}\n[{name}] граф пуст или не залит (`grafit load`)"
@@ -242,8 +252,9 @@ def _empty_answer(fr, name, question, kind, res) -> str | None:
     top = res["rows"][0]
     return (f"{fr.line}\n[{name}] {question}\nничего похожего (лучший score "
             f"{1 - res['best_dist']:.3f} ниже порога {1 - search.NONE_DIST:.3f}). Ближайшее — "
-            f"{top[1]} ({top[3]}:{top[4]}), скорее всего не то. Такого кода, вероятно, нет; "
-            f"переформулируй или проверь grep'ом по точному имени.")
+            f"{top[1]} ({top[3]}:{top[4]}), скорее всего не то. По этой формулировке не найдено — "
+            f"это не доказывает, что кода нет: переформулируй (синонимы, по-английски, имя "
+            f"вероятной функции) или проверь grep'ом по точному имени.")
 
 
 def _search_rows(question, project, k, kind):
@@ -282,7 +293,8 @@ def grafit_search(question: str, k: int = 8, project: str = "", kind: str = "pro
     слов запроса нет в именах (синонимы, RU/EN, опечатки). grep — только для известной строки.
 
     kind: prod (по умолч. — код без тестов/доков/генерёнки) | code | tests | docs | frontend |
-    backend | all. snippet: показать строки исходника. «ничего похожего» = такого кода нет."""
+    backend | all. snippet: показать строки исходника. «ничего похожего» — по этой формулировке
+    не найдено (переформулируй), а не гарантия, что такого кода нет."""
     g, name, res = _search_rows(question, project, k, kind)
     fr = _Fresh(name, project or None)
     empty = _empty_answer(fr, name, question, kind, res)
@@ -299,15 +311,17 @@ def grafit_find_existing(description: str, k: int = 6, project: str = "", kind: 
     Опиши назначение словами: «пересчитать норму часов сотрудника за месяц» → похожий
     существующий код со score и строками исходника; устойчив к другим названиям и опечаткам.
 
-    Сильное совпадение — переиспользуй/расширь найденное вместо нового кода."""
+    Сильное совпадение — переиспользуй/расширь найденное вместо нового кода. Сильное = лидер
+    выделяется из фона; при слабом аналог всё равно может быть в списке — проверь чтением."""
     g, name, res = _search_rows(description, project, k, kind)
     fr = _Fresh(name, project or None)
     empty = _empty_answer(fr, name, description, kind, res)
     if empty:
-        return empty.replace("Такого кода, вероятно, нет;", "Похожего кода, вероятно, нет — можно писать новый;")
-    q = search.match_quality(res["best_dist"])
+        return empty
+    q = _quality(res)
     advice = ("похожее уже есть — сначала посмотри, нельзя ли переиспользовать/расширить"
-              if q == "strong" else "явного аналога нет, но проверь кандидатов ниже")
+              if q == "strong" else
+              "явный лидер не выделяется — открой кандидатов ниже: аналог может быть среди них")
     out = [fr.line, f"[{name}] уже есть? «{description}»  (kind={kind} · {_verdict(res)})",
            f"вывод: {advice}"]
     out.extend(_render_rows(g, name, res["rows"], fr, snippet=True, neighbors=0,
@@ -383,14 +397,16 @@ def grafit_trace(source: str, project: str = "", max_hops: int = 4, target: str 
 
 @_tool
 def grafit_similar(symbol: str, project: str = "", file: str = "", k: int = 6,
-                   threshold: float = 0.10, kind: str = "all", rerank: bool = False,
+                   threshold: float = 0.10, kind: str = "auto", rerank: bool = False,
                    snippet: bool = True) -> str:
-    """Не дублирует ли символ уже существующий код — near-duplicate по смыслу тела (код→код).
+    """Не дублирует ли символ уже существующий код — near-duplicate по телу (код→код).
     Только что написал функцию — передай file=путь: символ читается из РАБОЧЕГО ДЕРЕВА, даже
     если его ещё нет в графе (проверка на приёмке). Без file — символ из графа.
 
-    threshold: макс. косинусная дистанция (0=идентично, дефолт 0.10). [копипаст]/[семантика] —
-    буквальная копия vs похожая логика. rerank: кросс-энкодер вторым проходом."""
+    Выдача: вероятные дубли (dist ≤ threshold, дефолт 0.10) + ближайшие за порогом со score.
+    Пусто в пределах порога ≠ дублей нет: дубль другой формы similar не видит — тогда зови
+    grafit_find_existing(«что делает символ»). kind=auto: prod, для теста — tests.
+    [копипаст]/[семантика] — буквальная копия vs похожая логика."""
     g, name = _graph(project or None)
     reranker = search.get_reranker(threads=THREADS)[0] if rerank else None
     root = _root(name)
@@ -407,7 +423,7 @@ def grafit_similar(symbol: str, project: str = "", file: str = "", k: int = 6,
     else:
         lines = dupes.format_similar(g, name, symbol, k=k, threshold=threshold, kind=kind,
                                      reranker=reranker, root=root if snippet else None)
-    _stat_set(n=sum(1 for ln in lines if ln.lstrip().startswith("≈")))
+    _stat_set(n=sum(1 for ln in lines if ln.lstrip().startswith(("≈", "~"))))
     return "\n".join([_fresh(name, project or None)] + lines)
 
 

@@ -35,6 +35,7 @@ _FRAMEWORK_METHODS = {
     "handle", "handleasync", "invoke", "invokeasync", "dispose", "disposeasync",
     "tostring", "equals", "gethashcode", "configure", "configureservices",
     "onmodelcreating", "main", "buildtargetmodel",
+    "props",   # тип пропсов React-компонента: у каждого свой, одинаковы по форме, не копипаст
 }
 
 
@@ -285,38 +286,61 @@ def fragment_ids(graph, nodes) -> set:
 
 # --- режим 1: дубли одного символа ------------------------------------------------
 
-def similar(graph, symbol: str, k: int = 6, threshold: float = 0.10,
-            kind: str = "all", reranker=None) -> dict | None:
-    """Найти near-duplicate узлы для символа (node-to-node). Возвращает dict с резолвом и
-    отфильтрованными кандидатами [(id,label,ft,sf,loc,text,dist)] или None, если символ не найден.
+def auto_kind(sf: str | None) -> str:
+    """kind по умолчанию для similar — по месту самого символа: продуктовый код ищет дубли в
+    продуктовом (prod: без тестов, доков, служебных .claude/.scratch), тест — в тестах,
+    служебный/прочий код — во всём коде."""
+    if common.is_test_path(sf):
+        return "tests"
+    return "prod" if common.kind_matches(sf, "code", "prod") else "code"
 
-    Фильтрация: self, generic/framework-шум, ОДИН source_file (co-location), прямые LINK-связи,
-    dist > threshold. reranker (опц.) пересортировывает оставшихся по кросс-энкодеру."""
+
+def split_near(rows, threshold: float, k: int) -> tuple[list, list]:
+    """(вероятные дубли dist≤threshold — до k, ближайшие ЗА порогом — добор до k).
+
+    Порог не отсекает выдачу: шкала e5 сжата, и дубль по смыслу другой формы (тот же
+    Intl.NumberFormat внутри switch) лежит на 0.10–0.12 — ровно там, где обрывался старый
+    ответ «похожих нет». Ближайшие за порогом показываем со score, решает чтение кода."""
+    dup = [r for r in rows if r[6] <= threshold][:k]
+    near = [r for r in rows if r[6] > threshold][:max(0, k - len(dup))]
+    return dup, near
+
+
+def similar(graph, symbol: str, k: int = 6, threshold: float = 0.10,
+            kind: str = "auto", reranker=None) -> dict | None:
+    """Найти near-duplicate узлы для символа (node-to-node). Возвращает dict с резолвом,
+    кандидатами в пределах порога [(id,label,ft,sf,loc,text,dist,jaccard)] и near — ближайшими
+    за порогом (добор до k), или None, если символ не найден.
+
+    Фильтрация: self, generic/framework-шум, ОДИН source_file (co-location), прямые LINK-связи.
+    reranker (опц.) пересортировывает оставшихся по кросс-энкодеру."""
     r = nav.resolve_node(graph, symbol)
     if not r:
         return None
+    kind = auto_kind(r["sf"]) if kind == "auto" else kind
     qvec = node_embedding(graph, r["id"])
     if qvec is None:
-        return {"resolved": r, "candidates": []}
+        return {"resolved": r, "candidates": [], "near": [], "kind": kind}
     linked = _linked_ids(graph, r["id"])
     own = list(owners(graph, [r["id"]]).values())
     is_type = not own and not r["label"].endswith(")") and r["ft"] == "code"
     atypes = [r["label"]] if is_type else (own or file_types(graph, r["sf"]))
-    out = _filter_near(graph, qvec, r["id"], r["label"], r["sf"], linked, k, threshold, kind,
+    out = _filter_near(graph, qvec, r["id"], r["label"], r["sf"], linked, k, kind,
                        anchor_types=atypes, anchor_is_type=is_type)
-    if reranker is not None and out:
-        out = _rerank_pairs(reranker, node_text(graph, r["id"]) or r["label"], out)
-    out = out[:k]
+    dup, near = split_near(out, threshold, k)
+    if reranker is not None and dup:
+        dup = _rerank_pairs(reranker, node_text(graph, r["id"]) or r["label"], dup)
     # Второй сигнал: Jaccard шинглов anchor↔кандидат — копипаст (высокий) vs семантика (низкий)
     ash = shingles(node_text(graph, r["id"]))
-    out = [(*row, jaccard(ash, shingles(row[5]))) for row in out]
-    return {"resolved": r, "candidates": out}
+    j = lambda rows: [(*row, jaccard(ash, shingles(row[5]))) for row in rows]
+    return {"resolved": r, "candidates": j(dup), "near": j(near), "kind": kind}
 
 
-def _filter_near(graph, qvec, self_id, self_label, self_sf, linked, k, threshold, kind,
+def _filter_near(graph, qvec, self_id, self_label, self_sf, linked, k, kind,
                  anchor_types=None, anchor_is_type=False):
     """Ближайшие по вектору узлы минус шум: self, прямые связи, usage-фрагменты, generic/
-    framework-методы, тот же файл (co-location ≠ клон), пары-семьи, чужой kind, dist>threshold."""
+    framework-методы, тот же файл (co-location ≠ клон), пары-семьи, чужой kind. Порог
+    дистанции здесь НЕ применяется — его делит split_near."""
     rows = nearest(graph, qvec, max(k * 8, 40))
     frag = fragment_ids(graph, rows)               # usage-узлы типа/символа — не дубли
     # метод интерфейса ↔ его реализация, база ↔ override — один контракт, не копипаст
@@ -332,8 +356,6 @@ def _filter_near(graph, qvec, self_id, self_label, self_sf, linked, k, threshold
         if is_family_pair(self_label, label):       # XCommand↔XCommandHandler — связь, не дубль
             continue
         if not common.kind_matches(sf, ft, kind):
-            continue
-        if dist > threshold:
             continue
         out.append((nid, label, ft, sf, loc, text, dist))
         if len(out) >= k * 3:
@@ -361,18 +383,21 @@ def worktree_text(root, sf: str, symbol: str, cache=None) -> dict | None:
 
 
 def similar_to_text(graph, qvec, anchor: dict, k: int = 6, threshold: float = 0.10,
-                    kind: str = "all", reranker=None) -> list:
-    """Near-duplicate узлы графа для кода ВНЕ графа (anchor = worktree_text): кандидаты
-    [(id,label,ft,sf,loc,text,dist,jaccard)]. Тот же отсев шума, что у similar()."""
+                    kind: str = "auto", reranker=None) -> dict:
+    """Near-duplicate узлы графа для кода ВНЕ графа (anchor = worktree_text): тот же отсев
+    шума и тот же контракт, что у similar() — {"candidates", "near", "kind"}."""
+    kind = auto_kind(anchor["sf"]) if kind == "auto" else kind
     ftypes = file_types(graph, anchor["sf"])
     is_type = type_name(anchor["label"]) in {type_name(t) for t in ftypes}
-    out = _filter_near(graph, qvec, None, anchor["label"], anchor["sf"], set(), k, threshold, kind,
+    out = _filter_near(graph, qvec, None, anchor["label"], anchor["sf"], set(), k, kind,
                        anchor_types=[anchor["label"]] if is_type else ftypes,
                        anchor_is_type=is_type)
-    if reranker is not None and out:
-        out = _rerank_pairs(reranker, anchor["text"], out)
+    dup, near = split_near(out, threshold, k)
+    if reranker is not None and dup:
+        dup = _rerank_pairs(reranker, anchor["text"], dup)
     ash = shingles(anchor["text"])
-    return [(*row, jaccard(ash, shingles(row[5]))) for row in out[:k]]
+    j = lambda rows: [(*row, jaccard(ash, shingles(row[5]))) for row in rows]
+    return {"candidates": j(dup), "near": j(near), "kind": kind}
 
 
 def _rerank_pairs(reranker, anchor_text, rows):
@@ -537,41 +562,56 @@ def _tag(literal: bool, jacc: float) -> str:
     return f"копипаст J={jacc:.2f}" if literal else f"семантика J={jacc:.2f}"
 
 
+def _similar_body(res: dict, threshold: float, label: str, root) -> list[str]:
+    """Тело ответа similar: вероятные дубли (≤ порога), затем ближайшие за порогом со score.
+    Никогда не говорит «дублей нет»: код→код по эмбеддингу не видит дубль другой формы, поэтому
+    пустой/слабый ответ всегда отправляет в find_existing (поиск по назначению словами)."""
+    cands, near = res["candidates"], res["near"]
+    out, cache = [], {}
+
+    def row(mark, nid, lbl, ft, sf, loc, text, dist, jacc):
+        tag = f"[{_tag(jacc >= LITERAL_JACCARD, jacc)}]  " if mark == "≈" else ""
+        out.append(f"\n  {mark}{dist:.4f}  {tag}{lbl} ({ft})  score {1 - dist:.2f}"
+                   f"\n          {sf}:{loc}")
+        out.extend(_snip(root, sf, loc, cache))
+    if cands:
+        out.append(f"  вероятные дубли (dist≤{threshold}): {len(cands)} — открой и сравни")
+        for c in cands:
+            row("≈", *c)
+    else:
+        out.append(f"  в пределах порога dist≤{threshold} кандидатов нет — это НЕ значит, что "
+                   f"дублей нет")
+    if near:
+        out.append(f"\n  ближайшие за порогом (дубль по смыслу другой формы тоже лежит здесь — "
+                   f"проверь чтением):")
+        for c in near:
+            row("~", *c)
+    if not cands and not near:
+        out.append("  кандидатов нет совсем (фильтр kind/шум отсёк всё) — повтори с kind=all")
+    if not cands:
+        out.append(f"  ⇒ обязательно: grafit_find_existing(\"что делает {label}, словами\") — "
+                   f"ищет по назначению, а не по форме кода")
+    return out
+
+
 def format_similar(graph, name: str, symbol: str, k: int = 6, threshold: float = 0.10,
-                   kind: str = "all", reranker=None, root=None) -> list[str]:
+                   kind: str = "auto", reranker=None, root=None) -> list[str]:
     res = similar(graph, symbol, k=k, threshold=threshold, kind=kind, reranker=reranker)
     if res is None:
         return [f"[{name}] символ '{symbol}' не найден"]
     r = res["resolved"]
     out = [f"[{name}] дубли ~ {r['label']} ({r['ft']}, {r['sf']}:{r['loc']})  "
-           f"порог dist≤{threshold}"]
-    cands = res["candidates"]
-    if not cands:
-        out.append("  похожих узлов в пределах порога нет (это хорошо — дублей не видно)")
-        return out
-    cache: dict = {}
-    for nid, label, ft, sf, loc, text, dist, jacc in cands:
-        out.append(f"\n  ≈{dist:.4f}  [{_tag(jacc >= LITERAL_JACCARD, jacc)}]  {label} ({ft})"
-                   f"\n          {sf}:{loc}")
-        out.extend(_snip(root, sf, loc, cache))
-    return out
+           f"порог dist≤{threshold} · kind={res['kind']}"]
+    return out + _similar_body(res, threshold, r["label"], root)
 
 
 def format_similar_text(graph, name: str, anchor: dict, qvec, k: int = 6, threshold: float = 0.10,
-                        kind: str = "all", reranker=None, root=None) -> list[str]:
-    cands = similar_to_text(graph, qvec, anchor, k=k, threshold=threshold, kind=kind,
-                            reranker=reranker)
+                        kind: str = "auto", reranker=None, root=None) -> list[str]:
+    res = similar_to_text(graph, qvec, anchor, k=k, threshold=threshold, kind=kind,
+                          reranker=reranker)
     out = [f"[{name}] дубли ~ {anchor['label']} (рабочее дерево: {anchor['sf']}:{anchor['loc']})  "
-           f"порог dist≤{threshold}"]
-    if not cands:
-        out.append("  похожих узлов в пределах порога нет (это хорошо — дублей не видно)")
-        return out
-    cache: dict = {}
-    for nid, label, ft, sf, loc, text, dist, jacc in cands:
-        out.append(f"\n  ≈{dist:.4f}  [{_tag(jacc >= LITERAL_JACCARD, jacc)}]  {label} ({ft})"
-                   f"\n          {sf}:{loc}")
-        out.extend(_snip(root, sf, loc, cache))
-    return out
+           f"порог dist≤{threshold} · kind={res['kind']}"]
+    return out + _similar_body(res, threshold, anchor["label"], root)
 
 
 def _hist_lines(items) -> list[str]:
